@@ -1,0 +1,5 @@
+policy     , run, valid, exit_code, wall_s            , cpu_time_s , peak_memory_bytes, temp_start_c, temp_peak_sampled_c, error
+scx_rusty  ,   1, True ,         0, 190.09465512899988, 1467.343065,                  ,         48.0,                92.0, 
+scx_lavd   ,   1, True ,         0, 161.05208874500022, 1451.765352,                  ,         47.0,                93.0, 
+scx_bpfland,   1, True ,         0, 183.97623890700015, 1584.625914,                  ,         48.0,                90.0, 
+default    ,   1, True ,         0, 163.13558771299995, 1481.526374,                  ,         48.0,                92.0, 

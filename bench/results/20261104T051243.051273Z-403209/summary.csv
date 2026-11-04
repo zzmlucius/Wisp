@@ -1,0 +1,13 @@
+policy     , run, valid, exit_code, wall_s            , cpu_time_s , peak_memory_bytes, temp_start_c, temp_peak_sampled_c, error
+default    ,   1, True ,         0, 159.97710243299844, 1467.393322,                  ,         45.0,                93.0, 
+scx_rusty  ,   1, False,         0, 163.293577896     , 1475.513332,                  ,         47.0,                56.0, "采样失败: 策略变化: state='disabling', 预期 'enabled'; 采样失败: 策略变化: state='disabled', 预期 'enabled'; 策略变化: state='disabled', 预期 'enabled'; 策略变化: state='disabled', 预期 'enabled'; 调度器提前退出，退出码 1"
+scx_bpfland,   1, True ,         0, 175.8924842159995 , 1560.552401,                  ,         48.0,                90.0, 
+scx_lavd   ,   1, True ,         0, 159.67883959199935, 1445.35674 ,                  ,         47.0,                92.0, 
+scx_rusty  ,   2, False,         0, 161.7728552589997 , 1473.13048 ,                  ,         47.0,                69.0, "采样失败: 策略变化: state='disabling', 预期 'enabled'; 采样失败: 策略变化: state='disabled', 预期 'enabled'; 策略变化: state='disabled', 预期 'enabled'; 策略变化: state='disabled', 预期 'enabled'; 调度器提前退出，退出码 1"
+scx_bpfland,   2, True ,         0, 177.67787042799864, 1559.555387,                  ,         48.0,                90.0, 
+scx_lavd   ,   2, True ,         0, 157.9878462839988 , 1442.425978,                  ,         47.0,                94.0, 
+default    ,   2, True ,         0, 161.2816144010012 , 1474.709745,                  ,         48.0,                92.0, 
+scx_rusty  ,   3, False,         0, 165.5472326800009 , 1510.579516,                  ,         47.0,                68.0, "采样失败: 策略变化: state='disabled', 预期 'enabled'; 策略变化: state='disabled', 预期 'enabled'; 策略变化: state='disabled', 预期 'enabled'; 调度器提前退出，退出码 1"
+scx_bpfland,   3, True ,         0, 177.3807387629986 , 1564.874705,                  ,         48.0,                90.0, 
+default    ,   3, True ,         0, 160.37382579400037, 1470.314951,                  ,         47.0,                92.0, 
+scx_lavd   ,   3, True ,         0, 158.43727652400048, 1448.795342,                  ,         48.0,                93.0, 

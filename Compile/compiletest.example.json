@@ -1,0 +1,53 @@
+{
+  "source": "/home/youruser/src/linux",
+  "kernel_config": "/home/youruser/configs/kernel.config",
+  "targets": [
+    "vmlinux"
+  ],
+  "jobs": 8,
+  "compiler": [
+    "gcc"
+  ],
+  "make": [
+    "make"
+  ],
+  "required_tools": [
+    "ld",
+    "as",
+    "flex",
+    "bison",
+    "perl",
+    "bc",
+    "openssl"
+  ],
+  "results_dir": "./results",
+  "build_root": "./builds",
+  "cooldown_s": 30,
+  "sample_interval_s": 1,
+  "temperature_sensor": null,
+  "cgroup_parent": null,
+  "scheduler_timeout_s": 30,
+  "scheduler_settle_s": 5,
+  "schedulers": {
+    "scx_lavd": {
+      "command": [
+        "scx_lavd"
+      ],
+      "ops": "lavd_1.1.4_x86_64_unknown_linux_gnu"
+    },
+    "scx_bpfland": {
+      "command": [
+        "scx_bpfland",
+        "--primary-domain",
+        "all"
+      ],
+      "ops": "bpfland_1.1.4_x86_64_unknown_linux_gnu"
+    },
+    "scx_rusty": {
+      "command": [
+        "scx_rusty"
+      ],
+      "ops": "rusty_1.1.4_x86_64_unknown_linux_gnu"
+    }
+  }
+}
