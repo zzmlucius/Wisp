@@ -84,7 +84,7 @@ def distribution(values):
 
 
 def summarize(rows, assessments, mode):
-    from compilebench.control import POLICIES
+    from compilebench_runner.control import POLICIES
     primary = "request_p99_us" if mode == "fixed_rps" else "avg_rps"
     policies = list(dict.fromkeys([*POLICIES, *(row["policy"] for row in rows)]))
     groups = {}

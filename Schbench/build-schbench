@@ -12,8 +12,8 @@ import tempfile
 import urllib.request
 
 import schbench_runner
-from compilebench.cli import acquire_lock
-from compilebench.system import command_output, digest, write_json
+from compilebench_runner.cli import acquire_lock
+from compilebench_runner.system import command_output, digest, write_json
 
 PROJECT = Path(__file__).resolve().parent
 COMMIT = "24e32b8ef67cbafb0761aed68747d90a291767ae"

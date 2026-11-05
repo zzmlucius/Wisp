@@ -13,12 +13,12 @@ import subprocess
 import sys
 import time
 
-from compilebench.cli import ConfigError, acquire_lock, build_environment, scheduler_specs
-from compilebench.control import BatchScheduler, ControlError, POLICIES
-from compilebench.interrupts import Interrupts
-from compilebench.policy import PolicyError, Scheduler, policy_name
-from compilebench.system import command_output, digest, machine_info, read, sensor_path, write_json
-from compilebench.workload import SAMPLE_FIELDS, measure
+from compilebench_runner.cli import ConfigError, acquire_lock, build_environment, scheduler_specs
+from compilebench_runner.control import BatchScheduler, ControlError, POLICIES
+from compilebench_runner.interrupts import Interrupts
+from compilebench_runner.policy import PolicyError, Scheduler, policy_name
+from compilebench_runner.system import command_output, digest, machine_info, read, sensor_path, write_json
+from compilebench_runner.workload import SAMPLE_FIELDS, measure
 
 from .results import FIELDS, assess, parse_results, summarize
 

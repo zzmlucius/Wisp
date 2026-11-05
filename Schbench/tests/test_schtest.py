@@ -17,9 +17,9 @@ from unittest.mock import patch
 import schbench_runner
 from schbench_runner import cli, cleanup
 from schbench_runner.results import FIELDS, assess, parse_results, summarize
-from compilebench.control import ControlError, POLICIES
-from compilebench.interrupts import Interrupts
-from compilebench.policy import PolicyError
+from compilebench_runner.control import ControlError, POLICIES
+from compilebench_runner.interrupts import Interrupts
+from compilebench_runner.policy import PolicyError
 
 
 HELP = "schbench usage: -m -t -r -F -n -s -w -z -i -R -L -j (--json)"

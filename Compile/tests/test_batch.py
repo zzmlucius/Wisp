@@ -11,10 +11,10 @@ import time
 import unittest
 from unittest.mock import patch
 
-from compilebench.cli import experiment, load_config, main
-from compilebench.control import BatchScheduler, ControlError, POLICIES
-from compilebench.interrupts import Interrupts
-from compilebench.policy import PolicyError, Scheduler
+from compilebench_runner.cli import experiment, load_config, main
+from compilebench_runner.control import BatchScheduler, ControlError, POLICIES
+from compilebench_runner.interrupts import Interrupts
+from compilebench_runner.policy import PolicyError, Scheduler
 import test_compilebench as single_tests
 
 FakeScheduler = single_tests.FakeScheduler
@@ -68,7 +68,7 @@ class BatchTests(unittest.TestCase):
         FakeBatchScheduler.fail_policy = FakeBatchScheduler.cancel_policy = None
 
     def run_batch(self, rounds, seed=431, interrupts=None):
-        with patch("compilebench.cli.Scheduler", FakeScheduler), patch("compilebench.control.BatchScheduler", FakeBatchScheduler):
+        with patch("compilebench_runner.cli.Scheduler", FakeScheduler), patch("compilebench_runner.control.BatchScheduler", FakeBatchScheduler):
             return experiment(load_config(self.config_path), interrupts, rounds=rounds, seed=seed)
 
     def test_two_rounds_have_eight_rows_in_saved_random_order(self):
@@ -122,7 +122,7 @@ class BatchTests(unittest.TestCase):
     def test_external_scheduler_is_refused_before_authorization(self):
         observer = FakeScheduler()
         observer.state.update(state="enabled", ops="external", switch_all="1")
-        with patch("compilebench.cli.Scheduler", return_value=observer), patch("compilebench.control.BatchScheduler") as controller:
+        with patch("compilebench_runner.cli.Scheduler", return_value=observer), patch("compilebench_runner.control.BatchScheduler") as controller:
             with self.assertRaisesRegex(PolicyError, "外部 scx"):
                 experiment(load_config(self.config_path), rounds=1)
             controller.assert_not_called()
@@ -136,7 +136,7 @@ class BatchTests(unittest.TestCase):
         self.assertTrue(all("源码输入" in row["error"] for row in rows))
 
     def test_positive_integer_dispatches_to_batch_mode(self):
-        with patch("compilebench.cli.acquire_lock", return_value=None), patch("compilebench.cli.load_config", return_value={}), patch("compilebench.cli.experiment", return_value=0) as run:
+        with patch("compilebench_runner.cli.acquire_lock", return_value=None), patch("compilebench_runner.cli.load_config", return_value={}), patch("compilebench_runner.cli.experiment", return_value=0) as run:
             self.assertEqual(main(["3"]), 0)
             self.assertEqual(run.call_args.kwargs["rounds"], 3)
 
@@ -229,7 +229,7 @@ while True: time.sleep(.05)
             "sys.exit(code)\n")
         guard.chmod(0o755)
         controller = self.controller(inhibit=True)
-        with patch("compilebench.control.shutil.which", return_value=str(guard)):
+        with patch("compilebench_runner.control.shutil.which", return_value=str(guard)):
             controller.open()
         self.assertTrue(marker.exists())
         self.assertEqual(controller.info["sleep_inhibition"]["status"], "held")
@@ -249,7 +249,7 @@ while True: time.sleep(.05)
 
     def test_missing_sleep_inhibitor_fails_before_authorization(self):
         controller = self.controller(inhibit=True)
-        with patch("compilebench.control.shutil.which", return_value=None), patch("compilebench.control.subprocess.run") as authorize:
+        with patch("compilebench_runner.control.shutil.which", return_value=None), patch("compilebench_runner.control.subprocess.run") as authorize:
             with self.assertRaisesRegex(ControlError, "systemd-inhibit"):
                 controller.open()
             authorize.assert_not_called()
@@ -260,7 +260,7 @@ while True: time.sleep(.05)
         guard.write_text(f"#!{sys.executable}\nimport sys\nprint('Failed to inhibit: denied',file=sys.stderr)\nsys.exit(1)\n")
         guard.chmod(0o755)
         controller = self.controller(inhibit=True)
-        with patch("compilebench.control.shutil.which", return_value=str(guard)):
+        with patch("compilebench_runner.control.shutil.which", return_value=str(guard)):
             with self.assertRaises(ControlError):
                 controller.open()
         with self.assertRaises(ControlError):

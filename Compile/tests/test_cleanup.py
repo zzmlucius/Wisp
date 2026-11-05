@@ -7,8 +7,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from compilebench import cleanup
-from compilebench.cli import acquire_lock
+from compilebench_runner import cleanup
+from compilebench_runner.cli import acquire_lock
 
 
 class CleanupTests(unittest.TestCase):

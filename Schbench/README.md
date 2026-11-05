@@ -1,6 +1,6 @@
 # schbench 调度器测试
 
-在 `Wisp/Schbench/` 中运行。Python 3.12+，正式负载使用普通用户；四策略批次额外需要 sudo、systemd-inhibit 和已安装的三个 scx。本目录复用同级 `Compile/compilebench/`，请保留两者的目录关系。
+在 `Wisp/Schbench/` 中运行。Python 3.12+，正式负载使用普通用户；四策略批次额外需要 sudo、systemd-inhibit 和已安装的三个 scx。本目录复用同级 `Compile/compilebench_runner/`，请保留两者的目录关系。
 
 ```sh
 cd ~/Documents/code/Wisp/Schbench
@@ -102,13 +102,13 @@ systemd-run --user --wait --pipe --collect \
 
 | 现有接口 | 本测试用途 |
 |---|---|
-| compilebench.cli.acquire_lock / scheduler_specs / build_environment | 跨负载互斥、调度器命令与完整 ops 校验、受控环境 |
-| compilebench.policy.Scheduler / policy_name | 只读策略观测、命名和任务 ext.enabled 核验 |
-| compilebench.control.BatchScheduler | 一次授权、常驻监督、稳定等待、EOF/中断收尾和整批防挂起 |
-| compilebench.workload.measure | 门控计时、0.1 秒策略检查、资源/温度/电源采样与进程树收尾 |
-| compilebench.metrics.BuildCgroup | 独立负载树 CPU/内存统计，缺失原因记录 |
-| compilebench.system / Interrupts | 环境快照、固定传感器、摘要、原子保存、中断保护 |
-| compilebench.cleanup.remove_entry | 仅删除已校验的记录条目；schtest 自己限定清理范围 |
+| compilebench_runner.cli.acquire_lock / scheduler_specs / build_environment | 跨负载互斥、调度器命令与完整 ops 校验、受控环境 |
+| compilebench_runner.policy.Scheduler / policy_name | 只读策略观测、命名和任务 ext.enabled 核验 |
+| compilebench_runner.control.BatchScheduler | 一次授权、常驻监督、稳定等待、EOF/中断收尾和整批防挂起 |
+| compilebench_runner.workload.measure | 门控计时、0.1 秒策略检查、资源/温度/电源采样与进程树收尾 |
+| compilebench_runner.metrics.BuildCgroup | 独立负载树 CPU/内存统计，缺失原因记录 |
+| compilebench_runner.system / Interrupts | 环境快照、固定传感器、摘要、原子保存、中断保护 |
+| compilebench_runner.cleanup.remove_entry | 仅删除已校验的记录条目；schtest 自己限定清理范围 |
 
 为共享测量器增加可选 `cpu_affinity`、`workload_label`，为监督器增加可选 `workload_name`；默认值保持 compiletest 原行为。schtest 不执行内核源码预读、olddefconfig 或内核构建。
 

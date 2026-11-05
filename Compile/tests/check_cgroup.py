@@ -8,9 +8,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from compilebench.policy import Scheduler
-from compilebench.system import power_state, write_json
-from compilebench.workload import measure
+from compilebench_runner.policy import Scheduler
+from compilebench_runner.system import power_state, write_json
+from compilebench_runner.workload import measure
 
 
 def main():
