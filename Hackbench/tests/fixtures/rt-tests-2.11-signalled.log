@@ -1,0 +1,7 @@
+Running in process mode with 1 groups using 4 file descriptors each (== 4 tasks)
+Each sender will pass 2147483647 messages of 100 bytes
+Signal 15 caught, longjmp'ing out!
+longjmp'ed out, reaping children
+sending SIGTERM to all child processes
+signaling 4 worker threads to terminate
+Time: 0.147

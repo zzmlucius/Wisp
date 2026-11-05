@@ -50,8 +50,9 @@ class BatchScheduler(Scheduler):
                 raise ControlError("多轮测试需要 systemd-inhibit 防止自动挂起；Fedora 请安装 systemd")
             guard = [executable, "--no-ask-password", "--what=idle:sleep", "--mode=block",
                      f"--who={self.workload_name}",
-                     "--why=" + ("kernel compilation benchmark in progress" if self.workload_name == "compiletest"
-                                 else "schbench benchmark in progress"), "--"]
+                     "--why=" + {"compiletest": "kernel compilation benchmark in progress",
+                                  "schtest": "schbench benchmark in progress"}.get(
+                                      self.workload_name, "hackbench benchmark in progress"), "--"]
             command = [*guard, *command]
             self.info["sleep_inhibition"] = {"what": "idle:sleep", "mode": "block",
                                              "status": "requested", "command": guard}

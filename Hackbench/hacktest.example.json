@@ -1,0 +1,25 @@
+{
+  "program": "/usr/bin/hackbench",
+  "workload": {
+    "mode": "process",
+    "communication": "socket",
+    "groups": 4,
+    "fds": 20,
+    "loops": 10000,
+    "datasize": 100
+  },
+  "cpus": "4-13",
+  "results_dir": "./bench/results",
+  "cooldown_s": 30,
+  "sample_interval_s": 1,
+  "timeout_s": 300,
+  "temperature_sensor": null,
+  "cgroup_parent": null,
+  "scheduler_timeout_s": 30,
+  "scheduler_settle_s": 5,
+  "schedulers": {
+    "scx_lavd": {"command": ["scx_lavd"], "ops": "lavd_1.1.4_x86_64_unknown_linux_gnu"},
+    "scx_bpfland": {"command": ["scx_bpfland", "--primary-domain", "all"], "ops": "bpfland_1.1.4_x86_64_unknown_linux_gnu"},
+    "scx_rusty": {"command": ["scx_rusty"], "ops": "rusty_1.1.4_x86_64_unknown_linux_gnu"}
+  }
+}

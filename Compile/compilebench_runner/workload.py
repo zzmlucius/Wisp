@@ -54,7 +54,7 @@ def abort_and_wait(pid, started):
 
 def measure(command, directory, environment, log_path, sample_path, scheduler,
             expected, sensor, expected_power, interval=1.0, cgroup_parent=None, interrupts=None,
-            verify_parameters=None, cpu_affinity=None, workload_label="编译"):
+            verify_parameters=None, cpu_affinity=None, workload_label="编译", timeout_s=None):
     """Gated fork: attach and verify the task before starting its make exec.
 
     No background threads exist at fork. wall_s starts immediately before SIGCONT
@@ -194,7 +194,11 @@ def measure(command, directory, environment, log_path, sample_path, scheduler,
                 os.kill(pid, signal.SIGCONT)
                 ready.set()
             interrupts.check()
-            select.select([pidfd], [], [])
+            readable, _, _ = select.select([pidfd], [], [], timeout_s)
+            if not readable:
+                notes["timeout"] = {"limit_s": timeout_s, "expired": True,
+                                    "cleanup": "terminate owned process group, escalate, reap and check cgroup"}
+                raise TimeoutError(f"{workload_label}超时（{timeout_s} 秒）；终止本次负载并保留无效记录")
             # pidfd readiness means wait4 won't block. Defer cancellation only
             # through reaping and assigning the status, never while make runs.
             with interrupts.defer():

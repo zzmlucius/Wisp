@@ -1,5 +1,0 @@
-policy     , run, valid, exit_code, wall_s            , cpu_time_s , peak_memory_bytes, temp_start_c, temp_peak_sampled_c, error
-scx_lavd   ,   1, True ,         0, 160.93223769800034, 1448.219643,                  ,         47.0,                92.0, 
-scx_bpfland,   1, False,          ,                   ,            ,                  ,             ,                    , "策略变化: enable_seq='7', 预期 '3'"
-default    ,   1, True ,         0, 165.80069532900006, 1488.340361,                  ,         44.0,                90.0, 
-scx_rusty  ,   1, True ,         0, 184.0567864720001 , 1463.377587,                  ,         47.0,                89.0, 
