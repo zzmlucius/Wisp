@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Build the pinned upstream schbench locally without installing system files."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.request
+
+import schbench_runner
+from compilebench.cli import acquire_lock
+from compilebench.system import command_output, digest, write_json
+
+PROJECT = Path(__file__).resolve().parent
+COMMIT = "24e32b8ef67cbafb0761aed68747d90a291767ae"
+SOURCE_HASH = "18720ce0a70b115f70fcae309ef9a70c98b005f6a7b0cdcf7a4fbf298b14795b"
+
+
+def main():
+    lock = None
+    try:
+        if os.getuid() == 0:
+            raise ValueError("请以普通用户构建，不需要 sudo")
+        lock = acquire_lock()
+        compiler = shutil.which("gcc")
+        if compiler is None:
+            raise ValueError("缺少 gcc；Fedora 可先安装 gcc 和 glibc-devel")
+        source = PROJECT / "bench/src" / ("schbench-" + COMMIT)
+        url = "https://codeload.github.com/masoncl/schbench/tar.gz/" + COMMIT
+        if not source.exists():
+            downloads = PROJECT / "bench/downloads"
+            downloads.mkdir(parents=True, exist_ok=True)
+            archive = downloads / ("schbench-" + COMMIT + ".tar.gz")
+            if not archive.exists():
+                part = archive.with_suffix(".part")
+                with urllib.request.urlopen(url, timeout=60) as response, part.open("wb") as output:
+                    shutil.copyfileobj(response, output)
+                part.replace(archive)
+            source.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=source.parent, prefix="extract-") as staging:
+                with tarfile.open(archive) as tar:
+                    tar.extractall(staging, filter="data")
+                (Path(staging) / source.name).rename(source)
+        src = source / "schbench.c"
+        if digest(src) != SOURCE_HASH:
+            raise ValueError("schbench.c 与固定官方提交摘要不符，拒绝构建")
+        build = PROJECT / "bench/build"
+        build.mkdir(parents=True, exist_ok=True)
+        command = [str(Path(compiler).resolve()), "-Wall", "-O2", "-g", "-W", "-D_LARGEFILE_SOURCE",
+                   "-D_FILE_OFFSET_BITS=64", str(src), "-o", str(build / "schbench.new"), "-lpthread", "-lm"]
+        with (build / "prepare.log").open("wb") as log:
+            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+        (build / "schbench.new").replace(build / "schbench")
+        write_json(build / "provenance.json", {
+            "repository": "https://github.com/masoncl/schbench", "commit": COMMIT,
+            "source_url": url, "source_sha256": SOURCE_HASH,
+            "binary_sha256": digest(build / "schbench"), "command": command,
+            "compiler": command_output([compiler, "--version"])})
+        print(f"已构建: {build / 'schbench'}（官方提交 {COMMIT}）")
+        return 0
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(f"构建失败: {exc}；编译输出见 bench/build/prepare.log", file=sys.stderr)
+        return 2
+    finally:
+        if lock is not None:
+            os.close(lock)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

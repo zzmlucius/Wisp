@@ -54,7 +54,7 @@ def abort_and_wait(pid, started):
 
 def measure(command, directory, environment, log_path, sample_path, scheduler,
             expected, sensor, expected_power, interval=1.0, cgroup_parent=None, interrupts=None,
-            verify_parameters=None):
+            verify_parameters=None, cpu_affinity=None, workload_label="编译"):
     """Gated fork: attach and verify the task before starting its make exec.
 
     No background threads exist at fork. wall_s starts immediately before SIGCONT
@@ -93,12 +93,14 @@ def measure(command, directory, environment, log_path, sample_path, scheduler,
                     verify_parameters()
                 scheduler.verify(expected)
                 if expected["state"] == "enabled" and scheduler.snapshot()["switch_all"] != "1":
-                    raise PolicyError("switch_all 不为 1；无法保证全部编译任务受目标 scx 管理")
+                    raise PolicyError("switch_all 不为 1；无法保证全部负载任务受目标 scx 管理")
                 # The leader may have exited between observation and wait4.
                 stat = read(f"/proc/{pid}/stat") or ""
                 alive = stat and stat.rsplit(")", 1)[-1].strip().split()[0] not in {"Z", "X"}
                 if alive:
                     scheduler.verify(expected, pid)
+                    if cpu_affinity is not None and os.sched_getaffinity(pid) != set(cpu_affinity):
+                        raise PolicyError("负载 CPU affinity 在运行期间变化")
             except (PolicyError, OSError) as exc:
                 sample_errors.append(str(exc))
             observed_power = power_state()
@@ -153,6 +155,8 @@ def measure(command, directory, environment, log_path, sample_path, scheduler,
             if pid == 0:
                 try:
                     os.setsid()
+                    if cpu_affinity is not None:
+                        os.sched_setaffinity(0, cpu_affinity)
                     signal.signal(signal.SIGINT, signal.SIG_DFL)
                     signal.signal(signal.SIGTERM, signal.SIG_DFL)
                     os.dup2(log.fileno(), 1)
@@ -169,7 +173,7 @@ def measure(command, directory, environment, log_path, sample_path, scheduler,
             _, status = os.waitpid(pid, os.WUNTRACED)
             if not os.WIFSTOPPED(status):
                 reaped = True
-                raise RuntimeError("编译进程未能进入计时门控")
+                raise RuntimeError(f"{workload_label}进程未能进入计时门控")
             cgroup.attach(pid)
             if verify_parameters:
                 verify_parameters()
@@ -205,12 +209,12 @@ def measure(command, directory, environment, log_path, sample_path, scheduler,
             scheduler.verify(expected)
             observed_power = power_state()
             notes["power"]["end"] = observed_power
-            issue = power_error(expected_power, observed_power, "构建结束")
+            issue = power_error(expected_power, observed_power, f"{workload_label}结束")
             if issue:
                 raise RuntimeError(issue)
             interrupts.check()
             if result["exit_code"] != 0:
-                errors.append(f"编译失败，退出码 {result['exit_code']}")
+                errors.append(f"{workload_label}失败，退出码 {result['exit_code']}")
         except KeyboardInterrupt:
             interrupted = True
             errors.append("用户中断")
@@ -229,7 +233,7 @@ def measure(command, directory, environment, log_path, sample_path, scheduler,
                         if start is not None:
                             end = time.monotonic()
                     except ChildProcessError:
-                        errors.append("编译进程退出状态丢失")
+                        errors.append(f"{workload_label}进程退出状态丢失")
                     terminate_group(pid)
                 elif pid:
                     try:
@@ -237,7 +241,7 @@ def measure(command, directory, environment, log_path, sample_path, scheduler,
                     except ProcessLookupError:
                         pass
                     else:
-                        errors.append("make 退出后仍有子进程；已终止本次进程组")
+                        errors.append(f"{workload_label}退出后仍有子进程；已终止本次进程组")
                         terminate_group(pid)
                 if pidfd is not None:
                     os.close(pidfd)
@@ -258,7 +262,7 @@ def measure(command, directory, environment, log_path, sample_path, scheduler,
                 temps = [sample["temp_c"] for sample in kept if sample["temp_c"] is not None]
                 result["temp_peak_sampled_c"] = max(temps) if temps else None
                 if sensor and not temps:
-                    notes["missing_metrics"]["temp_peak_sampled_c"] = "正式 make 窗口内没有有效温度样本"
+                    notes["missing_metrics"]["temp_peak_sampled_c"] = f"正式{workload_label}窗口内没有有效温度样本"
                 if result["temp_start_c"] is None:
                     notes["missing_metrics"]["temp_start_c"] = "起始温度不可用"
                 try:

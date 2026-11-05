@@ -19,12 +19,14 @@ class ControlError(PolicyError):
 
 
 class BatchScheduler(Scheduler):
-    def __init__(self, specs, directory, interrupts, timeout=30, settle=5, prefix=None, inhibit=True):
+    def __init__(self, specs, directory, interrupts, timeout=30, settle=5, prefix=None, inhibit=True,
+                 workload_name="compiletest"):
         super().__init__()
         self.specs, self.directory, self.interrupts = specs, Path(directory), interrupts
         self.timeout, self.settle = timeout, settle
         self.prefix = ["sudo", "-n"] if prefix is None else prefix
         self.inhibit = inhibit
+        self.workload_name = workload_name
         self.process = self.log = None
         self.active = False
         self.offset = 0
@@ -47,7 +49,9 @@ class BatchScheduler(Scheduler):
             if not executable:
                 raise ControlError("多轮测试需要 systemd-inhibit 防止自动挂起；Fedora 请安装 systemd")
             guard = [executable, "--no-ask-password", "--what=idle:sleep", "--mode=block",
-                     "--who=compiletest", "--why=kernel compilation benchmark in progress", "--"]
+                     f"--who={self.workload_name}",
+                     "--why=" + ("kernel compilation benchmark in progress" if self.workload_name == "compiletest"
+                                 else "schbench benchmark in progress"), "--"]
             command = [*guard, *command]
             self.info["sleep_inhibition"] = {"what": "idle:sleep", "mode": "block",
                                              "status": "requested", "command": guard}

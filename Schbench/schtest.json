@@ -1,0 +1,49 @@
+{
+  "program": "./bench/build/schbench",
+  "provenance": "./bench/build/provenance.json",
+  "cpus": "4,5,6,7,8,9,10,11,12,13",
+  "workload": {
+    "message_threads": 1,
+    "worker_threads": 10,
+    "runtime_s": 60,
+    "cache_footprint_kb": 256,
+    "operations": 5,
+    "sleep_us": 100,
+    "locking": true,
+    "warmup_s": 0,
+    "zero_interval_s": 0
+  },
+  "rps": null,
+  "rps_tolerance": 0.05,
+  "request_p99_limit_us": null,
+  "wakeup_p99_limit_us": null,
+  "results_dir": "./bench/results",
+  "cooldown_s": 30,
+  "sample_interval_s": 1,
+  "temperature_sensor": null,
+  "cgroup_parent": null,
+  "scheduler_timeout_s": 30,
+  "scheduler_settle_s": 5,
+  "schedulers": {
+    "scx_lavd": {
+      "command": [
+        "scx_lavd"
+      ],
+      "ops": "lavd_1.1.4_x86_64_unknown_linux_gnu"
+    },
+    "scx_bpfland": {
+      "command": [
+        "scx_bpfland",
+        "--primary-domain",
+        "all"
+      ],
+      "ops": "bpfland_1.1.4_x86_64_unknown_linux_gnu"
+    },
+    "scx_rusty": {
+      "command": [
+        "scx_rusty"
+      ],
+      "ops": "rusty_1.1.4_x86_64_unknown_linux_gnu"
+    }
+  }
+}
