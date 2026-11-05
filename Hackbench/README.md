@@ -101,14 +101,14 @@ Clean 用法与前两种测试一致：
 
 | 接口 | 用途 |
 |---|---|
-| compilebench.cli.acquire_lock / scheduler_specs / build_environment | 三种测试及清理互斥、命令/ops 校验、受控环境 |
-| compilebench.policy.Scheduler / policy_name | 当前策略观测、完整状态和 ext.enabled 核验 |
-| compilebench.control.BatchScheduler | 一次授权、稳定等待、常驻监督、防挂起与收尾 |
-| compilebench.workload.measure / BuildCgroup | 门控计时、采样、affinity、完整负载树统计与清理 |
-| compilebench.system / Interrupts | 环境、摘要、温度/电源、原子保存和中断保护 |
+| compilebench_runner.cli.acquire_lock / scheduler_specs / build_environment | 三种测试及清理互斥、命令/ops 校验、受控环境 |
+| compilebench_runner.policy.Scheduler / policy_name | 当前策略观测、完整状态和 ext.enabled 核验 |
+| compilebench_runner.control.BatchScheduler | 一次授权、稳定等待、常驻监督、防挂起与收尾 |
+| compilebench_runner.workload.measure / BuildCgroup | 门控计时、采样、affinity、完整负载树统计与清理 |
+| compilebench_runner.system / Interrupts | 环境、摘要、温度/电源、原子保存和中断保护 |
 | schbench_runner.cli.cpuset / finite / effective / append_error | 参数规范化、最终配置和错误合并 |
 | schbench_runner.results.distribution | 独立运行结果的中位数及范围 |
-| compilebench.cleanup.remove_entry | 删除已通过范围核验的记录条目 |
+| compilebench_runner.cleanup.remove_entry | 删除已通过范围核验的记录条目 |
 
 共享测量器仅新增可选 `timeout_s=None`，compiletest/schtest 原有调用继续无限等待正常负载结束；监督器补上 hacktest 的抑制锁描述，前两种测试的实际启动参数保留。不改已有实验配置，也不安装软件或修改系统设置。
 

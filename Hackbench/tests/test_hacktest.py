@@ -18,8 +18,8 @@ from unittest.mock import patch
 import hackbench_runner
 from hackbench_runner import cli, cleanup, preflight
 from hackbench_runner.results import FIELDS, parse_results, summarize
-from compilebench.control import POLICIES
-from compilebench.policy import PolicyError
+from compilebench_runner.control import POLICIES
+from compilebench_runner.policy import PolicyError
 from Schbench.tests import test_schtest as shared_doubles
 
 FakeScheduler = shared_doubles.FakeScheduler

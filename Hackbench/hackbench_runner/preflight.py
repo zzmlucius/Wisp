@@ -3,8 +3,8 @@ import os
 from pathlib import Path
 import resource
 
-from compilebench.cli import ConfigError
-from compilebench.system import read
+from compilebench_runner.cli import ConfigError
+from compilebench_runner.system import read
 
 
 def user_tasks():

@@ -3,8 +3,8 @@ from pathlib import Path
 import math
 import re
 
-from compilebench.cli import SUMMARY_FIELDS
-from compilebench.control import POLICIES
+from compilebench_runner.cli import SUMMARY_FIELDS
+from compilebench_runner.control import POLICIES
 from schbench_runner.results import distribution
 
 FIELDS = [*SUMMARY_FIELDS[:-1], "hackbench_s", "error"]

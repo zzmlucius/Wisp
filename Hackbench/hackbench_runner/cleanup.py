@@ -6,9 +6,9 @@ import shutil
 from pathlib import Path
 import sys
 
-from compilebench.cli import acquire_lock
-from compilebench.cleanup import remove_entry
-from compilebench.system import write_json
+from compilebench_runner.cli import acquire_lock
+from compilebench_runner.cleanup import remove_entry
+from compilebench_runner.system import write_json
 
 PROJECT = Path(__file__).resolve().parents[1]
 
