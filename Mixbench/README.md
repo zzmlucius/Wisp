@@ -12,7 +12,7 @@
 |---|---:|
 | 前台目标 `rps` | 1000 请求/秒 |
 | `rps_tolerance` | 0.02，即 ±2%（980–1020 请求/秒，含边界） |
-| `latency_limit_us` | 请求 p99 ≤ 10000 µs，即 10 ms |
+| `latency_limit_us` | 请求 p99 ≤ 30000 µs，即 30 ms；也是 `valid` 的必要条件 |
 | 前后台各自运行时长 `runtime_s` | 60 秒，并发运行 |
 | 后台 `threads` / `cpu_max_prime` | 14 / 20000 |
 
@@ -60,6 +60,34 @@ cd ~/Documents/code/Wisp/Mixbench
 
 每次前后台同时运行，因此不是 60+60 秒。整批实际时间还需加入每次冷却、准备、策略切换和收尾；脚本不增加内部重复或预实验次数。
 
+## 可选逐次唤醒观测
+
+排查 wakeup p99 时，在原命令后添加 `--observe-wakeup`：
+
+```sh
+./mixtest 3 -500 --observe-wakeup         # 保持 500 RPS，随机四策略，各三轮
+./mixtest -500 --observe-wakeup          # 只观察当前调度器一次
+```
+
+第一次开启会在冷却和正式测量前，用本地固定提交源码自动构建独立程序 `bench/build/wakeup-observer/schbench-observe`；需要现有源码和 gcc，无需 sudo、无需下载，不替换 Schbench 的正式程序。观测程序、来源摘要和版本标记会进入本批快照，默认命令仍使用原程序。`--case back` 没有前台，不能开启此选项。
+
+运行中每条记录复用原来已有的时钟和延迟值，不增加逐条计时系统调用，不写文件、不打印日志、不分配内存。每个 worker 预先分配并触及固定容量 4096 条记录的内存；14 worker 的事件缓冲合计约 0.875 MiB。各 worker 独占写入自己的缓冲，投递标记使用轻量原子读写。超过容量后仅累计丢失条数，不动态扩容，也不影响原来的原生直方图。
+
+所有原生线程完成后才统一写出，每次的 `run-NNN/<策略>/` 新增：
+
+| 文件 | 用途 |
+|---|---|
+| `front-wakeup.csv` | 每条被保存的原生 wakeup 样本：worker、序号、恢复时间、计时起点、延迟（µs）、停止标志、最近投递位置 |
+| `front-wakeup-running.csv` | 完整观测中仅保留 stopping=0 的样本；供运行阶段 p99 计算与核对 |
+| `front-wakeup.meta.json` | 原生总样本数、已保存和丢失数量、是否完整、各 worker 数量及 CSV 写出耗时 |
+| `front-wakeup-summary.json` | 全部、运行阶段、停止阶段及最近投递标记分别统计的 p99、最大值、超过 100 ms 数量和最慢 20 条 |
+
+先看 `capture_complete`：为 `false` 时保存的是不完整样本，不能据此重建整次 p99。`stopping=1` 表示记录该样本时已置停止标志；`last_post_kind=shutdown/request` 表示最近一次投递代码位置，不是内核跟踪得到的精确唤醒原因。计时起点用“现有恢复时间减原生延迟”还原；固定 RPS 模式可能重复覆盖原生 wake_time，因此这些记录用于定位已有统计的来源，不能当作严格内核 wake-to-run 跟踪。
+
+启用观测时，`summary.csv.wakeup_p99_us` 使用完整观测中 stopping=0 样本的 nearest-rank p99，可能与原生分桶近似百分位略有不同。停止阶段不固定删除 14 条，也不按延迟大小筛选。原始 `front-wakeup.csv`、`front.log` 和原生 JSON 保留全量值；`attempt.json.wakeup_filter` 保存原生 p99、保留/排除数量和规则版本 `running-wakeup-v1`。元数据的 `wakeup_metric` 明确标记口径，未启用观测仍使用原生全量 p99，两种口径不能混作同一组结果排名。
+
+缺失/中断/溢出或没有运行阶段样本时，筛选后的 wakeup_p99_us 留空，并按必需指标缺失标记该次技术无效；不回退到原生全量值，也不改变 RPS 或请求 p99 阈值。CSV 写出发生在原生统计结束后，写出耗时单列；外层 wall_s、CPU/内存统计仍包含这点开销，不宣称观测为零开销。
+
 ## 同步与有效性
 
 共享测量器先门控一个普通用户协调器；协调器在没有后台线程时 fork 两个原生子进程，全部 SIGSTOP 就绪后共同 SIGCONT。子进程在 exec 紧前写入单调时钟时间戳，退出由 waitpid 观测（约 10 ms 轮询，忙时可能更迟）。不是通过依次启动两个独立测试入口来近似并发。
@@ -76,13 +104,17 @@ cd ~/Documents/code/Wisp/Mixbench
 
 计时核验版本 `bounded_approximate_v2` 修正了将 schbench 配置的 60 秒当成原生实测统计时长的问题。固定源码在 `sleep_for_runtime` 内每轮检查结束条件，未结束时执行 `sleep(1)`；配置时长不能直接等同于进程退出时间。新规则把这一个已知轮询周期单独列出，前台预算为 `1.0 + max_native_overhead_s`，当前为 1.5 秒；后台没有这项轮询豁免，仍核对真实 `total time` 和固定时长。
 
-例如前台运行 61.1 秒会留下轮询预算内的警告，运行 61.7 秒仍然无效，不能因为想得到有效结果继续放宽。该预算不能证明多出的时间全部属于收尾，也不能证明前后台的原生统计窗口精确一致；需要严格共同窗口时应另行增加原生边界观测。启动错位、进程重叠不足、超时、退出异常、策略/配置/供电变化继续判无效。负载命令、1000 RPS ±2%、请求 p99≤10 ms、60 秒时长和后台 14 线程均未因这次计时修正改变。
+例如前台运行 61.1 秒会留下轮询预算内的警告，运行 61.7 秒仍然无效，不能因为想得到有效结果继续放宽。该预算不能证明多出的时间全部属于收尾，也不能证明前后台的原生统计窗口精确一致；需要严格共同窗口时应另行增加原生边界观测。启动错位、进程重叠不足、超时、退出异常、策略/配置/供电变化继续判无效。计时修正没有改变负载命令、1000 RPS ±2%、60 秒时长和后台 14 线程；当前请求 p99 标准已另行改为 ≤30 ms，并纳入下文的 `valid` 判定。
 
-核验版本、来源和预算保存在 `metadata.json.timing_validation`、`snapshot.json.timing_validation` 及逐次 `attempt.json.synchronization`。前台字段明确标为 `configured_duration_s`，后台为 `native_duration_s`，原生绝对统计起止继续留空；`wall_s` 仍是实测进程窗口。历史结果不改写，前后版本的有效次数不能直接混为同一验收口径。性能是否达标继续单独记录，修正计时后不会自动将超限的前台变为达标。
+核验版本、来源和预算保存在 `metadata.json.timing_validation`、`snapshot.json.timing_validation` 及逐次 `attempt.json.synchronization`。前台字段明确标为 `configured_duration_s`，后台为 `native_duration_s`，原生绝对统计起止继续留空；`wall_s` 仍是实测进程窗口。历史计时有效性不回写，前后版本的有效次数不能直接混为同一验收口径。性能是否达标继续单独记录，修正计时后不会自动将超限的前台变为达标。
 
 启动严重错位、重叠不足、额外启动/收尾时间超限、版本计时口径不明、原生失败、必需指标缺失或通用核验失败，均为技术无效。短任务的启动/退出比例更大，验证时使用独立配置并保留其容差，不冒充 60 秒正式成绩。
 
-`valid` 与前台是否达标分开：程序正常自然退出、指标可解析、同步和通用核验通过才技术有效。平均 RPS 在目标 ±容差内且请求 p99 ≤ 上限，前台才达标。唤醒 p99 作为辅助指标，不另加隐含阈值。性能未达标、后台吞吐为零仍保留有效结果；`attempt.json.constraints.met=false`，不通过剔除慢结果来排名。
+`valid=True` 要求程序正常自然退出、指标可解析、同步和通用核验通过，**同时请求 `request_p99_us ≤ latency_limit_us`**；默认上限 **30000 µs（30 ms，包含等号）**。唤醒 p99 作为辅助指标，不使用这条延迟阈值。低请求 p99 不能抵消程序、同步、策略或环境错误。
+
+`summary.csv.error` 用“测试执行/核验错误: …”与“请求 p99 超限: …”区分原因；两者同时发生时都写出。`attempt.json` 保存 `technical_valid`、`technical_error`、`latency_validity`（实际值、上限、达标状态）和 `invalid_reasons`（`technical_error` / `p99_exceeded` / `p99_unavailable`），明确区分正常运行但延迟超限、测试本身出错和延迟无法取得。`metadata.json.validity_policy` 保存规则版本 `request-p99-validity-v1`。所有结果和日志均保留，历史 CSV 不自动改写；仅延迟超限不会提前结束后续轮次，但整批入口返回非零状态。原生 `exit_code=0` 仅表示正常退出，不保证 `valid=True`。
+
+前台达标仍要求平均 RPS 在目标 ±容差内且请求 p99 达标，记录在 `attempt.json.constraints`。仅 RPS 不足、后台吞吐为零不单独使 `valid=False`；前台未达标的结果不纳入满足前台约束的胜者比较。back 单独测试无请求 p99 门槛；front 预实验显式设置 `latency_limit_us=null` 时不启用延迟门槛，前台达标状态留空。正式 mixed 必须配置上限，同一场景四策略一致。完整判定见 [MIXBENCH.md](MIXBENCH.md#valid-判定与无效原因)。
 
 任一原生负载失败，协调器立即停止另一侧。超时、Ctrl+C、TERM 由共享自有 session/cgroup 收尾；不处理无关进程。单次失败保留无效行；多轮仅在已核验恢复默认后继续，监督进程丢失、恢复失败或用户中断则停止，不伪造未尝试的行。
 
@@ -99,7 +131,8 @@ policy,run,valid,exit_code,wall_s,cpu_time_s,peak_memory_bytes,temp_start_c,temp
 | 字段 | 含义 |
 |---|---|
 | `avg_rps` | 前台最终整次平均请求/秒；不使用 RPS p50 |
-| `request_p99_us` / `wakeup_p99_us` | 前台最终累计请求/唤醒 p99，µs；不平均多个窗口 p99 |
+| `request_p99_us` | 前台原生最终累计处理阶段请求 p99，µs；不含完整入队等待，不平均多个窗口 p99 |
+| `wakeup_p99_us` | 开启观测：完整 stopping=0 样本的 p99；未开启：原生全量 p99，均为 µs，口径见 metadata.wakeup_metric |
 | `back_events_s` | 后台原生最终 events/s，前台达标后越高越好 |
 | `wall_s` | 首个正式原生 exec 紧前到最后一个退出观测，单调时钟秒；不含协调器准备/收尾 |
 | `cpu_time_s` | 共同父 cgroup 的两侧完整进程树及协调器少量开销累计 CPU 秒 |

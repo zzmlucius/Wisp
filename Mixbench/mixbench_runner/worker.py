@@ -71,7 +71,13 @@ def launch(spec, path, interrupts, evidence):
                     os.sched_setaffinity(0, spec["cpus"])
                     os.kill(os.getpid(), signal.SIGSTOP)
                     os.write(write_fd, f"{time.monotonic():.9f}\n".encode())
-                    os.execvpe(command[0], command, os.environ)
+                    environment = os.environ.copy()
+                    # Trace only the frontend and never inherit stale output paths from the terminal.
+                    environment.pop("WISP_WAKEUP_TRACE_DIR", None)
+                    environment.pop("WISP_WAKEUP_CAPACITY", None)
+                    if side == "front":
+                        environment.update(spec.get("front_environment", {}))
+                    os.execvpe(command[0], command, environment)
                 except BaseException as exc:
                     os.write(2, f"native exec failed: {exc}\n".encode())
                     os._exit(127)

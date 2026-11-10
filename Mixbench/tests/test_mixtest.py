@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import mixbench_runner
 from mixbench_runner import cli, cleanup, configuration, results
+from mixbench_runner import observation
 from compilebench_runner.control import POLICIES
 from compilebench_runner.policy import PolicyError, Scheduler as RealScheduler
 from compilebench_runner.system import digest, write_json
@@ -125,6 +126,16 @@ class Fixture(unittest.TestCase):
 
 
 class ArgumentTests(Fixture):
+    def test_observation_option_reaches_configuration(self):
+        cfg = self.cfg()
+        with patch.object(cli.os, "getuid", return_value=1000), \
+             patch.object(cli, "acquire_lock", return_value=None), \
+             patch.object(cli, "load_config", return_value=cfg) as load, \
+             patch.object(cli, "experiment", return_value=0):
+            self.assertEqual(cli.main(["3", "-500", "--observe-wakeup"]), 0)
+            self.assertTrue(load.call_args.kwargs["observe_wakeup"])
+            self.assertEqual(load.call_args.args[2], 500)
+
     def test_rps_spellings_and_rounds(self):
         for argv in [["1", "-1000"], ["1", "-n", "1000"], ["1", "-n1000"],
                      ["1", "--rps", "1000"], ["-1000", "1"]]:
@@ -170,6 +181,12 @@ class ArgumentTests(Fixture):
 
 
 class ConfigurationTests(Fixture):
+    def test_observation_back_rejected_and_saved_flag_not_silently_enabled(self):
+        with self.assertRaisesRegex(ValueError, "需要前台"):
+            self.cfg("back", observe_wakeup=True)
+        self.change(wakeup_observation={"enabled": True})
+        self.assertNotIn("wakeup_observation", self.cfg())
+
     def test_shipped_scenario_generates_requested_native_workloads(self):
         project = Path(mixbench_runner.__file__).resolve().parents[1]
         for filename in ['mixtest.json', 'mixtest.example.json']:
@@ -181,7 +198,7 @@ class ConfigurationTests(Fixture):
             settings['results_dir'] = str(self.root / 'records')
             self.config.write_text(json.dumps(settings))
             cfg = self.cfg(); cmd = configuration.commands(cfg, self.root)
-            self.assertEqual((cfg['rps'], cfg['rps_tolerance'], cfg['latency_limit_us']), (1000, .02, 10000))
+            self.assertEqual((cfg['rps'], cfg['rps_tolerance'], cfg['latency_limit_us']), (1000, .02, 30000))
             for flag, expected in [('-m','1'),('-t','14'),('-r','60'),('-F','256'),('-n','5'),('-s','100'),('-R','1000'),('-w','0'),('-z','0')]:
                 self.assertEqual(cmd['front'][cmd['front'].index(flag)+1], expected, filename)
             for value in ['--threads=14','--cpu-max-prime=20000','--time=60','--events=0','--rate=0','--report-interval=1']:
@@ -192,7 +209,7 @@ class ConfigurationTests(Fixture):
         for key in ['runtime_s','rps','rps_tolerance','latency_limit_us','timeout_s']:
             settings.pop(key,None)
         self.config.write_text(json.dumps(settings));cfg=self.cfg()
-        self.assertEqual((cfg['runtime_s'],cfg['rps'],cfg['rps_tolerance'],cfg['latency_limit_us']), (60,1000,.02,10000))
+        self.assertEqual((cfg['runtime_s'],cfg['rps'],cfg['rps_tolerance'],cfg['latency_limit_us']), (60,1000,.02,30000))
 
     def test_native_cpu_without_warmup_option_remains_usable(self):
         self.back.write_text(self.back.read_text().replace('--warmup-time ',''))
@@ -245,7 +262,7 @@ class ConfigurationTests(Fixture):
         self.assertEqual(cmd['front'][cmd['front'].index('-z')+1],'0')
 
     def test_output_cannot_overlap_other_workloads(self):
-        for path in [self.root,self.root/'tests',self.root.parent/'Compile/bench/results',self.root.parent/'Hackbench/bench/results']:
+        for path in [self.root,self.root/'tests',self.root/'native',self.root.parent/'Compile/bench/results',self.root.parent/'Hackbench/bench/results']:
             with self.subTest(path=path),self.assertRaises(ValueError):self.cfg(output=path)
 
     def test_effective_config_roundtrip(self):
@@ -282,9 +299,44 @@ class ResultTests(Fixture):
         row={'avg_rps':1000,'request_p99_us':250,'wakeup_p99_us':7}
         self.assertIsNone(results.assess(row,cfg)['met'])
 
-    def test_performance_failure_is_separate_from_validity(self):
-        cfg=self.cfg();row={'avg_rps':100,'request_p99_us':500,'wakeup_p99_us':7,'valid':True}
+    def test_rps_failure_is_separate_from_validity(self):
+        cfg=self.cfg();row={'avg_rps':100,'request_p99_us':250,'wakeup_p99_us':7,'valid':True}
+        details={};results.finalize_validity(row,details,cfg)
         self.assertFalse(results.assess(row,cfg)['met']);self.assertTrue(row['valid'])
+        self.assertTrue(details['technical_valid']);self.assertEqual(details['invalid_reasons'],[])
+
+    def test_request_p99_validity_boundary_and_missing_values(self):
+        cfg=self.cfg();cfg['latency_limit_us']=30000
+        for value,met in [(29999,True),(30000,True),(30000.001,False),
+                          (None,False),(float('nan'),False),(float('inf'),False),(-1,False)]:
+            with self.subTest(value=value):
+                row={'valid':True,'request_p99_us':value};details={}
+                results.finalize_validity(row,details,cfg)
+                self.assertEqual(row['valid'],met)
+                self.assertTrue(details['technical_valid'])
+                self.assertEqual(details['latency_validity']['met'],met)
+                if not met:
+                    self.assertEqual(details['invalid_reasons'],
+                        ['p99_exceeded' if value is not None and value>=0 and value<float('inf') else 'p99_unavailable'])
+
+    def test_technical_error_is_preserved_with_or_without_p99_failure(self):
+        cfg=self.cfg()
+        for p99,reason in [(250,[]),(500,['p99_exceeded']),(None,['p99_unavailable'])]:
+            with self.subTest(p99=p99):
+                row={'valid':False,'error':'调度器提前退出','request_p99_us':p99};details={}
+                results.finalize_validity(row,details,cfg)
+                self.assertFalse(row['valid']);self.assertFalse(details['technical_valid'])
+                self.assertEqual(details['invalid_reasons'],['technical_error']+reason)
+                self.assertIn('测试执行/核验错误: 调度器提前退出',row['error'])
+                self.assertEqual('请求 p99 超限' in row['error'],p99==500)
+
+    def test_back_and_unconfigured_front_pilot_have_no_p99_gate(self):
+        for case in ['back','front']:
+            cfg=self.cfg(case)
+            if case=='front':cfg['latency_limit_us']=None
+            row={'valid':True,'request_p99_us':None};details={}
+            results.finalize_validity(row,details,cfg)
+            self.assertTrue(row['valid']);self.assertIsNone(details['latency_validity']['met'])
 
     def test_sync_rejects_skew_low_overlap_and_unaccounted_time(self):
         evidence={'children':{side:{'exec_monotonic_s':1.,'exit_monotonic_s':2.01,'exit_code':0,'reaped':True} for side in ['front','back']}}
@@ -351,6 +403,52 @@ class ResultTests(Fixture):
 
 
 class RunTests(Fixture):
+    def test_complete_observation_updates_csv_attempt_and_analysis_consistently(self):
+        cfg=self.cfg();cfg['wakeup_observation']={'enabled':True}
+        observed={'status':'complete','capture_complete':True,
+                  'groups':{'running':{'count':98,'p99_us':2},'stopping':{'count':2,'p99_us':7}}}
+        with patch.object(self,'cfg',return_value=cfg), patch.object(cli,'summarize_trace',return_value=observed):
+            self.assertEqual(self.run_fake(rounds=1),0)
+        self.assertTrue(all(row['wakeup_p99_us']=='2' and row['valid']=='True' for row in self.rows()))
+        metadata=json.loads((self.batch()/'metadata.json').read_text())
+        self.assertEqual(metadata['wakeup_metric']['scope'],'running_only')
+        for policy,data in metadata['analysis']['policies'].items():
+            self.assertEqual(data['metrics_valid']['wakeup_p99_us']['median'],2)
+        for path in self.batch().glob('run-*/*/attempt.json'):
+            detail=json.loads(path.read_text())
+            self.assertEqual(detail['result']['wakeup_p99_us'],2)
+            self.assertEqual(detail['wakeup_filter']['native_wakeup_p99_us'],7)
+
+    def test_missing_observation_leaves_filtered_metric_empty_and_still_cleans_scheduler(self):
+        cfg = self.cfg();cfg["wakeup_observation"] = {"enabled": True}
+        with patch.object(self, "cfg", return_value=cfg):
+            self.assertEqual(self.run_fake(rounds=1), 1)
+        self.assertTrue(all(row["valid"] == "False" and row["wakeup_p99_us"] == "" for row in self.rows()))
+        for path in self.batch().glob("run-*/*/attempt.json"):
+            detail = json.loads(path.read_text())
+            self.assertEqual(detail["wakeup_observation"]["status"], "unavailable")
+            self.assertEqual(detail["wakeup_filter"]["native_wakeup_p99_us"], 7)
+        self.assertEqual(json.loads((self.batch()/"metadata.json").read_text())["final_scheduler"]["state"], "disabled")
+
+    def test_observation_write_error_does_not_block_scheduler_cleanup(self):
+        cfg = self.cfg();cfg["wakeup_observation"] = {"enabled": True}
+        with patch.object(self, "cfg", return_value=cfg), \
+             patch.object(cli, "summarize_trace", side_effect=OSError("disk unavailable")):
+            self.assertEqual(self.run_fake(rounds=1), 1)
+        self.assertEqual(json.loads((self.batch()/"metadata.json").read_text())["final_scheduler"]["state"], "disabled")
+
+    def test_observation_environment_is_front_only_and_stale_values_removed(self):
+        front_marker, back_marker = self.root/"front-env", self.root/"back-env"
+        self.write_front(extra=f"Path({str(front_marker)!r}).write_text(os.environ.get('WISP_WAKEUP_TRACE_DIR','absent'))")
+        self.write_back(extra=f"Path({str(back_marker)!r}).write_text(os.environ.get('WISP_WAKEUP_TRACE_DIR','absent'))")
+        cfg=self.cfg();cfg["wakeup_observation"]={"enabled":True}
+        with patch.dict(os.environ, {"WISP_WAKEUP_TRACE_DIR":"stale", "WISP_WAKEUP_CAPACITY":"1"}):
+            self.assertEqual(cli.experiment(cfg),1)
+        attempt=next(self.batch().glob("run-*/*"))
+        self.assertEqual(front_marker.read_text(),str(attempt))
+        self.assertEqual(back_marker.read_text(),"absent")
+        self.assertEqual(json.loads((attempt/"launch.json").read_text())["front_environment"]["WISP_WAKEUP_CAPACITY"],"4096")
+
     def test_single_silent_schema_and_current_policy_preserved(self):
         observer=FakeScheduler();before=observer.snapshot();out=io.StringIO()
         with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out):self.assertEqual(self.run_fake(observer=observer),0)
@@ -364,12 +462,24 @@ class RunTests(Fixture):
         self.assertEqual(metadata['timing_validation']['revision'],'bounded_approximate_v2')
         self.assertEqual(snapshot['timing_validation'],metadata['timing_validation'])
 
-    def test_underperforming_front_is_kept_technically_valid(self):
+    def test_p99_failure_is_invalid_but_technically_valid_and_kept(self):
         self.change(latency_limit_us=100)
-        self.assertEqual(self.run_fake(),0)
-        row,=self.rows();self.assertEqual(row['valid'],'True')
+        self.assertEqual(self.run_fake(),1)
+        row,=self.rows();self.assertEqual(row['valid'],'False');self.assertEqual(row['exit_code'],'0')
+        self.assertIn('请求 p99 超限',row['error']);self.assertNotIn('测试执行/核验错误',row['error'])
         detail=json.loads((self.batch()/'run-001/default/attempt.json').read_text())
         self.assertFalse(detail['constraints']['met'])
+        self.assertTrue(detail['technical_valid']);self.assertEqual(detail['invalid_reasons'],['p99_exceeded'])
+        self.assertFalse(detail['latency_validity']['met'])
+
+    def test_latency_failure_does_not_stop_remaining_rounds(self):
+        self.change(latency_limit_us=100)
+        self.assertEqual(self.run_fake(rounds=3),1)
+        rows=self.rows();self.assertEqual(len(rows),12);self.assertEqual(FakeBatch.opens,1)
+        self.assertTrue(all(row['valid']=='False' and '请求 p99 超限' in row['error'] for row in rows))
+        metadata=json.loads((self.batch()/'metadata.json').read_text())
+        self.assertEqual(metadata['final_scheduler']['state'],'disabled')
+        self.assertEqual(metadata['validity_policy']['revision'],'request-p99-validity-v1')
 
     def test_front_pilot_without_targets_can_run(self):
         self.change(rps=None,latency_limit_us=None)
@@ -470,7 +580,131 @@ class RunTests(Fixture):
             unrelated.terminate();unrelated.wait()
 
 
+class ObservationTests(Fixture):
+    def write_trace(self, dropped=0):
+        attempt=self.root/'trace';attempt.mkdir()
+        rows=[{'worker_id':0,'sequence':1,'resume_realtime_us':1000100,'origin_realtime_us':1000000,
+               'latency_us':100,'stopping':0,'last_post_kind':'request'},
+              {'worker_id':0,'sequence':2,'resume_realtime_us':2000000,'origin_realtime_us':1150000,
+               'latency_us':850000,'stopping':1,'last_post_kind':'shutdown'}]
+        with (attempt/'front-wakeup.csv').open('w',newline='') as stream:
+            writer=csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
+        write_json(attempt/'front-wakeup.meta.json',{'schema_version':1,'capture_complete':not dropped,
+            'recorded_samples':2,'native_wakeup_samples':2+dropped,'dropped_samples':dropped})
+        return attempt
+
+    def test_summary_keeps_running_and_stopping_samples_separate(self):
+        attempt=self.write_trace();original=(attempt/'front-wakeup.csv').read_bytes()
+        summary=observation.summarize_trace(attempt)
+        self.assertEqual(summary['status'],'complete')
+        self.assertEqual(summary['groups']['all']['p99_us'],850000)
+        self.assertEqual(summary['groups']['running']['p99_us'],100)
+        self.assertEqual(summary['groups']['stopping']['count'],1)
+        self.assertEqual(summary['by_last_post']['shutdown']['over_100ms'],1)
+        self.assertEqual(summary['slowest'][0]['last_post_kind'],'shutdown')
+        self.assertEqual((attempt/'front-wakeup.csv').read_bytes(),original)
+        with (attempt/'front-wakeup-running.csv').open() as stream:filtered=list(csv.DictReader(stream))
+        self.assertEqual(len(filtered),1);self.assertEqual(filtered[0]['stopping'],'0')
+        row={'wakeup_p99_us':850000,'avg_rps':1000,'request_p99_us':250,'valid':True};details={}
+        self.assertIsNone(observation.apply_running_wakeup(row,details,summary))
+        self.assertEqual(row['wakeup_p99_us'],100)
+        self.assertEqual(row['avg_rps'],1000);self.assertEqual(row['request_p99_us'],250)
+        self.assertTrue(row['valid'])
+        self.assertEqual(details['wakeup_filter']['native_wakeup_p99_us'],850000)
+        self.assertEqual(details['wakeup_filter']['excluded_samples'],1)
+
+    def test_no_stopping_samples_means_nothing_is_discarded(self):
+        attempt=self.write_trace()
+        text=(attempt/'front-wakeup.csv').read_text().replace('850000,1,shutdown','850000,0,request')
+        (attempt/'front-wakeup.csv').write_text(text)
+        summary=observation.summarize_trace(attempt)
+        row={'wakeup_p99_us':850000};details={}
+        self.assertIsNone(observation.apply_running_wakeup(row,details,summary))
+        self.assertEqual(row['wakeup_p99_us'],850000)
+        self.assertEqual(details['wakeup_filter']['excluded_samples'],0)
+
+    def test_no_running_samples_leaves_metric_empty(self):
+        attempt=self.write_trace()
+        text=(attempt/'front-wakeup.csv').read_text().replace('100,0,request','100,1,shutdown')
+        (attempt/'front-wakeup.csv').write_text(text)
+        summary=observation.summarize_trace(attempt)
+        row={'wakeup_p99_us':850000};details={}
+        self.assertIn('没有 stopping=0',observation.apply_running_wakeup(row,details,summary))
+        self.assertIsNone(row['wakeup_p99_us'])
+
+    def test_overflow_does_not_claim_complete_percentiles(self):
+        summary=observation.summarize_trace(self.write_trace(dropped=1))
+        self.assertEqual(summary['status'],'incomplete')
+        self.assertFalse(summary['capture_complete'])
+        self.assertEqual(summary['capture']['dropped_samples'],1)
+        row={'wakeup_p99_us':850000};details={}
+        self.assertIn('不完整',observation.apply_running_wakeup(row,details,summary))
+        self.assertIsNone(row['wakeup_p99_us'])
+        self.assertEqual(details['wakeup_filter']['native_wakeup_p99_us'],850000)
+
+    def test_missing_or_corrupted_trace_is_explicit(self):
+        attempt=self.root/'missing';attempt.mkdir()
+        self.assertEqual(observation.summarize_trace(attempt)['status'],'unavailable')
+        attempt=self.write_trace()
+        text=(attempt/'front-wakeup.csv').read_text().replace('850000','850001')
+        (attempt/'front-wakeup.csv').write_text(text)
+        self.assertEqual(observation.summarize_trace(attempt)['status'],'unavailable')
+
+
+@unittest.skipUnless(shutil.which('gcc'), 'native observation verification requires gcc')
+class NativeObservationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp=tempfile.TemporaryDirectory(prefix='wakeup-native-tests-')
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.root=Path(cls.temp.name)
+        project=Path(mixbench_runner.__file__).resolve().parents[1]
+        cls.project=cls.root/'Mixbench'
+        (cls.project/'native').mkdir(parents=True)
+        shutil.copy2(project/'native/wakeup_observer.h',cls.project/'native/wakeup_observer.h')
+        (cls.root/'Schbench').symlink_to(project.parent/'Schbench',target_is_directory=True)
+        source=cls.root/'Schbench/bench/src'/('schbench-'+observation.COMMIT)/'schbench.c'
+        if not source.exists():raise unittest.SkipTest('pinned native source is unavailable')
+        cls.binary,cls.provenance,cls.identity,_=observation.ensure_observer(cls.project)
+
+    def run_native(self, capacity):
+        attempt=self.root/('run-'+str(capacity));attempt.mkdir()
+        environment=os.environ.copy();environment.update(WISP_WAKEUP_TRACE_DIR=str(attempt),WISP_WAKEUP_CAPACITY=str(capacity))
+        command=[self.binary,'-m','2','-t','2','-r','2','-F','16','-n','1','-s','100',
+                 '-R','100','-w','0','-z','0','-i','3','-j',str(attempt/'front-native.json')]
+        with (attempt/'front.log').open('w') as log:
+            process=subprocess.run(command,env=environment,stdout=log,stderr=subprocess.STDOUT,timeout=10)
+        self.assertEqual(process.returncode,0,(attempt/'front.log').read_text())
+        metrics,_=results.parse_front(attempt/'front.log',attempt/'front-native.json',2)
+        self.assertGreater(metrics['avg_rps'],0)
+        return attempt,observation.summarize_trace(attempt)
+
+    def test_native_events_match_original_count_and_have_shutdown_markers(self):
+        attempt,summary=self.run_native(4096)
+        self.assertEqual(summary['status'],'complete')
+        self.assertEqual(summary['capture']['allocated_event_bytes'],4*4096*16)
+        self.assertGreater(summary['groups']['running']['count'],0)
+        self.assertGreater(summary['groups']['stopping']['count'],0)
+        self.assertGreater(summary['by_last_post']['shutdown']['count'],0)
+        self.assertEqual(summary['groups']['all']['count'],summary['capture']['native_wakeup_samples'])
+        with (attempt/'front-wakeup.csv').open() as stream:rows=list(csv.DictReader(stream))
+        self.assertEqual({int(row['worker_id']) for row in rows},{0,1,2,3})
+        self.assertEqual(observation.ensure_observer(self.project)[2],self.identity)
+
+    def test_native_capacity_exhaustion_keeps_original_histogram(self):
+        _,summary=self.run_native(1)
+        self.assertEqual(summary['status'],'incomplete')
+        self.assertGreater(summary['capture']['dropped_samples'],0)
+        self.assertEqual(summary['capture']['recorded_samples']+summary['capture']['dropped_samples'],
+                         summary['capture']['native_wakeup_samples'])
+
+
 class CleanupTests(Fixture):
+    def test_observation_source_directory_is_protected(self):
+        self.change(results_dir="native")
+        with self.assertRaisesRegex(ValueError,"保留目录"):
+            cleanup.roots(self.config)
+
     def test_clean_only_marked_mix_records_and_custom_roots(self):
         self.assertEqual(self.run_fake(),0);batch=self.batch()
         other=batch.parent/'foreign';other.mkdir();write_json(other/'metadata.json',{'workload':'hackbench'})

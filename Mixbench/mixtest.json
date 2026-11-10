@@ -18,7 +18,7 @@
   "cpus": "4-13",
   "rps": 1000,
   "rps_tolerance": 0.02,
-  "latency_limit_us": 10000,
+  "latency_limit_us": 30000,
   "synchronization": {
     "max_start_skew_s": 0.1,
     "min_overlap_ratio": 0.99,
@@ -53,7 +53,7 @@
     },
     "scx_rusty": {
       "command": [
-        "scx_rusty"
+        "/home/lucius/.local/scx-rusty-fixed/bin/scx_rusty"
       ],
       "ops": "rusty_1.1.4_x86_64_unknown_linux_gnu"
     }

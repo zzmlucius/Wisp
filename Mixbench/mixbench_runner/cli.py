@@ -21,7 +21,8 @@ from compilebench_runner.workload import SAMPLE_FIELDS, measure
 from schbench_runner.cli import append_error, effective
 
 from .configuration import active_sides, commands, load_config
-from .results import FIELDS, TIMER_SOURCES, TIMING_VALIDATION, assess, baseline_ratios, parse_back, parse_front, summarize, synchronization
+from .observation import apply_running_wakeup, metric_policy, summarize_trace, trace_environment
+from .results import FIELDS, TIMER_SOURCES, TIMING_VALIDATION, assess, baseline_ratios, finalize_validity, parse_back, parse_front, summarize, synchronization, validity_rule
 
 PROJECT = Path(__file__).resolve().parents[1]
 
@@ -38,6 +39,7 @@ def save_inputs(cfg, directory, initial):
         PROJECT.parent / "Compile/compilebench_runner", PROJECT.parent / "Schbench/schbench_runner")
         for path in package.glob("*.py")}
     inputs.update({cfg[side]["program"]: cfg["_program_sha256"][side] for side in active_sides(cfg["case"])})
+    inputs.update(cfg.get("_observation_files", {}))
     if cfg["case"] != "back":
         inputs[cfg["front"]["provenance"]] = cfg["_front"]["_provenance_sha256"]
     snapshot = {"created_utc": datetime.now(timezone.utc).isoformat(), "parameters": effective(cfg),
@@ -123,6 +125,8 @@ def run_attempt(cfg, directory, snapshot, sensor, scheduler, initial, policy, ru
         scheduler.verify(expected)
         spec = {"commands": cmd, "cpus": cfg["cpus"], "sample_interval_s": cfg["sample_interval_s"],
                 "sensor": str(sensor) if sensor else None, "expected_scheduler": expected}
+        if cfg.get("wakeup_observation", {}).get("enabled"):
+            spec["front_environment"] = trace_environment(attempt, cfg)
         write_json(attempt / "launch.json", spec)
         launch_sha = digest(attempt / "launch.json")
         def verify_launch():
@@ -185,9 +189,18 @@ def run_attempt(cfg, directory, snapshot, sensor, scheduler, initial, policy, ru
                 except Exception as exc:
                     fatal = str(exc)
                     append_error(row, fatal)
+            if cfg.get("wakeup_observation", {}).get("enabled"):
+                try:
+                    details["wakeup_observation"] = summarize_trace(attempt)
+                except Exception as exc:
+                    details["wakeup_observation"] = {"status": "unavailable", "capture_complete": False, "error": str(exc)}
+                issue = apply_running_wakeup(row, details, details["wakeup_observation"])
+                if issue:
+                    append_error(row, issue)
             cancelled = cancelled or interrupts.requested
             if cancelled:
                 append_error(row, "用户中断")
+            finalize_validity(row, details, cfg)
             details["constraints"] = assess(row, cfg)
             details["baselines"] = baseline_ratios(cfg, snapshot, row)
             details["result"] = row
@@ -218,18 +231,21 @@ def experiment(cfg, interrupts=None, rounds=None, seed=None):
     scheduler = BatchScheduler(specs, directory, interrupts, timeout=cfg.get("scheduler_timeout_s", 30),
         settle=cfg.get("scheduler_settle_s", 5), workload_name="mixtest") if rounds is not None else observer
     metadata = {"schema_version": 2, "workload": "mixbench", "config": effective(cfg),
+                "validity_policy": validity_rule(cfg),
                 "scope": "randomized_blocks" if rounds is not None else "single_current_scheduler",
                 "rounds": rounds or 1, "seed": seed if rounds is not None else None,
                 "orders": orders, "initial_scheduler": initial, "attempts": [], "status": "running",
                 "started_utc": datetime.now(timezone.utc).isoformat(),
                 "metrics": {"avg_rps": "前台整次平均请求/秒", "request_p99_us": "前台请求 p99，µs",
-                    "wakeup_p99_us": "前台唤醒 p99，µs", "back_events_s": "后台原生 CPU speed events/s，不用配置时长重算",
+                    "wakeup_p99_us": "前台运行阶段唤醒 p99（stopping=0），µs" if cfg.get("wakeup_observation", {}).get("enabled") else "前台原生全量唤醒 p99，µs",
+                    "back_events_s": "后台原生 CPU speed events/s，不用配置时长重算",
                     "wall_s": "首个原生 exec 紧前至最后一个退出观测，单调时钟秒",
                     "cpu_time_s": "双方完整进程树和协调器的父 cgroup CPU 秒",
                     "peak_memory_bytes": "父 cgroup 内存峰值字节，不相加子组峰值；含缓存及内核内存，不含 swap",
                     "temperature": "同一传感器，°C；峰值仅为正式负载期间采样最高值"},
                 "native_timing": TIMER_SOURCES, "synchronization": cfg["synchronization"],
                 "timing_validation": dict(TIMING_VALIDATION),
+                "wakeup_metric": metric_policy(bool(cfg.get("wakeup_observation", {}).get("enabled"))),
                 "commands": commands(cfg, directory / "run-NNN/POLICY")}
 
     rows, assessments, cancelled, fatal = [], [], False, None
@@ -292,6 +308,7 @@ def parser():
     p.add_argument("-n", "--rps", type=int, help="覆盖独立预实验确定的统一前台 RPS；也可简写为 -1000")
     p.add_argument("--bg-threads", type=int, help="覆盖后台线程数")
     p.add_argument("--output", type=Path, help="结果根目录；相对于调用时工作目录")
+    p.add_argument("--observe-wakeup", action="store_true", help="逐次唤醒观测；汇总 p99 仅统计 stopping=0，原始记录保留")
     return p
 
 
@@ -325,7 +342,8 @@ def main(argv=None):
         if os.getuid() == 0:
             raise ConfigError("请以普通用户运行 mixtest；只有多轮监督进程提权")
         lock = acquire_lock()
-        cfg = load_config(PROJECT / "mixtest.json", args.case, args.rps, args.bg_threads, args.output)
+        cfg = load_config(PROJECT / "mixtest.json", args.case, args.rps, args.bg_threads, args.output,
+                          observe_wakeup=args.observe_wakeup)
         interrupts.install()
         return experiment(cfg, interrupts, rounds=int(args.rounds) if args.rounds is not None else None)
     except KeyboardInterrupt:

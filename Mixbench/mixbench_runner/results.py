@@ -1,4 +1,4 @@
-"""Separate technical validity, foreground constraints and background throughput."""
+"""Separate technical failures, request-p99 validity and foreground throughput constraints."""
 import csv
 import json
 import math
@@ -10,6 +10,7 @@ from compilebench_runner.system import power_error
 from schbench_runner.results import FIELDS as FRONT_FIELDS, distribution, number, parse_results as parse_front
 
 FIELDS = [*FRONT_FIELDS[:-1], "back_events_s", "error"]
+VALIDITY_REVISION = "request-p99-validity-v1"
 TIMER_SOURCES = {
     "front": "schbench 24e32b8: message 线程创建后 sleep_for_runtime 开始计时，结束设 stopping，join 后打印整次分布；average rps=累计请求数/配置 runtime；精确边界未外部观测",
     "back": "sysbench 1.0.20: 全部线程就绪的 barrier 回调启动计时，join workers 后停止；CPU speed 使用原生 events / checkpoint interval；warmup=0，未启用 checkpoint",
@@ -39,6 +40,48 @@ def parse_back(path):
     if fields["native_duration_s"] <= 0:
         raise ValueError("sysbench 原生测量时长必须为正数")
     return fields
+
+
+def validity_rule(cfg):
+    limit = cfg.get("latency_limit_us")
+    return {"revision": VALIDITY_REVISION, "metric": "request_p99_us", "limit_us": limit,
+            "applicable": cfg["case"] != "back" and limit is not None,
+            "rule": "原有执行/核验通过，且 request_p99_us <= latency_limit_us（默认 30000 µs）"}
+
+
+def latency_validity(row, cfg):
+    info = validity_rule(cfg)
+    value = row.get("request_p99_us")
+    valid_value = type(value) in (int, float) and math.isfinite(value) and value >= 0
+    info["actual_us"] = value if valid_value else None
+    if not info["applicable"]:
+        return {**info, "met": None, "reason": "back 无前台；或 front 预实验未配置延迟上限"}
+    if not valid_value:
+        return {**info, "met": False, "reason": "请求 p99 缺失或非法，无法判定延迟是否达标"}
+    met = value <= info["limit_us"]
+    return {**info, "met": met, "reason": None if met else
+            f"请求 p99 超限: {value:g} µs ({value/1000:g} ms) > {info['limit_us']:g} µs ({info['limit_us']/1000:g} ms)"}
+
+
+def finalize_validity(row, details, cfg):
+    """Do not mistake an operational failure for a pure latency failure, or vice versa."""
+    technical_valid = bool(row["valid"])
+    technical_error = row.get("error", "")
+    latency = latency_validity(row, cfg)
+    reasons = []
+    if not technical_valid:
+        reasons.append("technical_error")
+    if latency["met"] is False:
+        reasons.append("p99_exceeded" if latency["actual_us"] is not None else "p99_unavailable")
+    details.update(technical_valid=technical_valid, technical_error=technical_error,
+                   latency_validity=latency, invalid_reasons=reasons)
+    messages = []
+    if not technical_valid:
+        messages.append("测试执行/核验错误: " + (technical_error or "未通过原有技术检查"))
+    if latency["met"] is False:
+        messages.append(latency["reason"])
+    row["valid"] = technical_valid and latency["met"] is not False
+    row["error"] = "; ".join(messages)
 
 
 def assess(row, cfg):

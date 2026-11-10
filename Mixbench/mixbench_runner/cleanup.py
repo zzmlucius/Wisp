@@ -30,7 +30,7 @@ def roots(config_path):
     index = PROJECT / "bench/results-index.json"
     if index.exists():
         candidates.extend(Path(value) for value in json.loads(index.read_text())["roots"])
-    protected = [PROJECT / "mixbench_runner", PROJECT / "tests", PROJECT / "bench/src",
+    protected = [PROJECT / "mixbench_runner", PROJECT / "native", PROJECT / "tests", PROJECT / "bench/src",
                  PROJECT / "bench/build", PROJECT / "bench/downloads", PROJECT.parent / "Compile", PROJECT.parent / "Schbench", PROJECT.parent / "Hackbench"]
     programs = []
     for side in ("front", "back"):

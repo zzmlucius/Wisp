@@ -41,7 +41,7 @@
     },
     "scx_rusty": {
       "command": [
-        "scx_rusty"
+        "/home/lucius/.local/scx-rusty-fixed/bin/scx_rusty"
       ],
       "ops": "rusty_1.1.4_x86_64_unknown_linux_gnu"
     }

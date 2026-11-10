@@ -20,6 +20,6 @@
   "schedulers": {
     "scx_lavd": {"command": ["scx_lavd"], "ops": "lavd_1.1.4_x86_64_unknown_linux_gnu"},
     "scx_bpfland": {"command": ["scx_bpfland", "--primary-domain", "all"], "ops": "bpfland_1.1.4_x86_64_unknown_linux_gnu"},
-    "scx_rusty": {"command": ["scx_rusty"], "ops": "rusty_1.1.4_x86_64_unknown_linux_gnu"}
+    "scx_rusty": {"command": ["/home/lucius/.local/scx-rusty-fixed/bin/scx_rusty"], "ops": "rusty_1.1.4_x86_64_unknown_linux_gnu"}
   }
 }

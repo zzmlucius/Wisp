@@ -37,7 +37,7 @@ def executable(value, base, label):
 
 def protected_paths(cfg, config_path):
     project = Path(cfg["_project"])
-    paths = [project / "mixbench_runner", project / "tests", project / "bench/src", project / "bench/build"]
+    paths = [project / "mixbench_runner", project / "native", project / "tests", project / "bench/src", project / "bench/build"]
     paths += [project.parent / name for name in ("Compile", "Schbench", "Hackbench")]
     paths += [Path(cfg[side]["program"]) for side in ("front", "back") if Path(cfg[side]["program"]).is_absolute()]
     root = Path(cfg["results_dir"])
@@ -50,7 +50,7 @@ def protected_paths(cfg, config_path):
     return paths
 
 
-def load_config(path, case="mixed", rps=None, bg_threads=None, output=None):
+def load_config(path, case="mixed", rps=None, bg_threads=None, output=None, observe_wakeup=False):
     path = Path(path).resolve()
     raw = path.read_bytes()
     cfg = json.loads(raw)
@@ -58,6 +58,10 @@ def load_config(path, case="mixed", rps=None, bg_threads=None, output=None):
         raise ConfigError("mixtest.json 顶层必须为对象")
     if case not in {"mixed", "front", "back"}:
         raise ConfigError("case 必须为 mixed/front/back")
+    if observe_wakeup and case == "back":
+        raise ConfigError("--observe-wakeup 需要前台；不能用于 --case back")
+    # Observation is explicitly enabled by the CLI, never inherited silently from a saved config.
+    cfg.pop("wakeup_observation", None)
     cfg.update(case=case, _project=str(PROJECT))
     cfg["cpus"] = cpuset(cfg["cpus"])
     if not set(cfg["cpus"]) <= os.sched_getaffinity(0):
@@ -100,7 +104,7 @@ def load_config(path, case="mixed", rps=None, bg_threads=None, output=None):
     finite(cfg.setdefault("rps_tolerance", 0.02), "rps_tolerance")
     if cfg["rps_tolerance"] >= 1:
         raise ConfigError("rps_tolerance 须小于 1")
-    if cfg.setdefault("latency_limit_us", 10000) is not None:
+    if cfg.setdefault("latency_limit_us", 30000) is not None:
         finite(cfg["latency_limit_us"], "latency_limit_us", positive=True)
     if case == "mixed" and cfg["latency_limit_us"] is None:
         raise ConfigError("mixed 须先配置独立预实验确定的 latency_limit_us；可先执行 --case front")
@@ -129,6 +133,15 @@ def load_config(path, case="mixed", rps=None, bg_threads=None, output=None):
         if "/" in value:
             cfg[side]["program"] = str((path.parent / Path(value).expanduser()).resolve())
     front["provenance"] = str((path.parent / Path(front["provenance"]).expanduser()).resolve())
+    if observe_wakeup:
+        from .observation import CAPACITY, FILTER_REVISION, ensure_observer
+        program, provenance, identity, files = ensure_observer(PROJECT)
+        front.update(program=program, provenance=provenance)
+        cfg["_program_sha256"]["front"] = digest(program)
+        cfg["_observation_files"] = files
+        cfg["wakeup_observation"] = {"enabled": True, "capacity_per_worker": CAPACITY,
+            **identity, "filter_revision": FILTER_REVISION, "filter_rule": "stopping == 0",
+            "note": "汇总 wakeup_p99_us 仅统计运行阶段；原生全量值和原始样本另行保留"}
     if case != "back":
         front_cfg = {"program": front["program"], "provenance": front["provenance"], "cpus": cfg["cpus"],
             "workload": {key: value for key, value in front.items() if key not in {"program", "provenance"}},

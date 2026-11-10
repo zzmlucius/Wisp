@@ -18,7 +18,7 @@
   "cpus": "4-13",
   "rps": 1000,
   "rps_tolerance": 0.02,
-  "latency_limit_us": 10000,
+  "latency_limit_us": 30000,
   "synchronization": {
     "max_start_skew_s": 0.1,
     "min_overlap_ratio": 0.99,
