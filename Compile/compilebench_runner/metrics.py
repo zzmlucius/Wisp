@@ -79,10 +79,17 @@ class BuildCgroup:
                 "peak_memory_bytes": int(peak) if peak is not None else None}
 
     def pids(self):
-        return [int(pid) for pid in (read(self.path / "cgroup.procs") or "").split()] if self.path else []
+        if not self.path:
+            return []
+        return list({int(pid) for file in self.path.rglob("cgroup.procs")
+                     for pid in (read(file) or "").split()})
 
     def close(self):
         if self.path:
+            # Only our unique per-attempt subtree may contain workload subgroups.
+            for directory in sorted((p for p in self.path.rglob("*") if p.is_dir()),
+                                    key=lambda p: len(p.parts), reverse=True):
+                directory.rmdir()
             self.path.rmdir()  # Never remove an external cgroup or a nonempty one.
 
     def kill_remaining(self):

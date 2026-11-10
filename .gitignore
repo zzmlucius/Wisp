@@ -1,0 +1,11 @@
+# Python caches
+__pycache__/
+*.pyc
+
+# Generated benchmark sources, builds, results and validation records
+bench/
+
+# Compile local configuration and legacy output directories
+/Compile/**/compiletest.json
+/Compile/**/results/
+/Compile/**/builds/

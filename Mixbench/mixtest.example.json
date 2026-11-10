@@ -1,0 +1,61 @@
+{
+  "front": {
+    "program": "../Schbench/bench/build/schbench",
+    "provenance": "../Schbench/bench/build/provenance.json",
+    "message_threads": 1,
+    "worker_threads": 14,
+    "cache_footprint_kb": 256,
+    "operations": 5,
+    "sleep_us": 100,
+    "locking": true
+  },
+  "back": {
+    "program": "sysbench",
+    "threads": 14,
+    "cpu_max_prime": 20000
+  },
+  "runtime_s": 60,
+  "cpus": "4-13",
+  "rps": 1000,
+  "rps_tolerance": 0.02,
+  "latency_limit_us": 10000,
+  "synchronization": {
+    "max_start_skew_s": 0.1,
+    "min_overlap_ratio": 0.99,
+    "max_native_overhead_s": 0.5
+  },
+  "baselines": {
+    "front": null,
+    "back": null
+  },
+  "results_dir": "./bench/results",
+  "cooldown_s": 30,
+  "sample_interval_s": 1,
+  "timeout_s": 180,
+  "temperature_sensor": null,
+  "cgroup_parent": null,
+  "scheduler_timeout_s": 30,
+  "scheduler_settle_s": 5,
+  "schedulers": {
+    "scx_lavd": {
+      "command": [
+        "scx_lavd"
+      ],
+      "ops": "lavd_1.1.4_x86_64_unknown_linux_gnu"
+    },
+    "scx_bpfland": {
+      "command": [
+        "scx_bpfland",
+        "--primary-domain",
+        "all"
+      ],
+      "ops": "bpfland_1.1.4_x86_64_unknown_linux_gnu"
+    },
+    "scx_rusty": {
+      "command": [
+        "scx_rusty"
+      ],
+      "ops": "rusty_1.1.4_x86_64_unknown_linux_gnu"
+    }
+  }
+}

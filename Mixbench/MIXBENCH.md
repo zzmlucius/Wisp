@@ -2,9 +2,9 @@
 
 ## 目标与目录
 
-新增 Python 3 入口，复用现有 compiletest/schtest/hacktest。先读 `COMPILE.md`、`SCHBENCH.md`、`HACKBENCH.md`及实际目录中的 AGENTS.md、配置和代码：通用快照、策略核验、门控计时、采样、常驻提权监督、sleep 阻止锁、互斥、失败处理和 Clean 均沿用已有实现。直接组合原生程序或底层接口，不并行调用会各自切换策略、获取批次锁的测试入口；README 列出复用接口。
+新增 Python 3 入口，复用现有 compiletest/schtest/hacktest。先读 `COMPILE.md`、`SCHBENCH.md`、`HACKBENCH.md`及实际目录中的配置和代码：通用快照、策略核验、门控计时、采样、常驻提权监督、sleep 阻止锁、互斥、失败处理和 Clean 均沿用已有实现。直接组合原生程序或底层接口，不并行调用会各自切换策略、获取批次锁的测试入口；README 列出复用接口。
 
-代码、配置、测试、README 和 `bench/`放在 `Mixbench/`，本文路径相对此目录，先进入后执行；本文档留在项目根目录。首版实现“固定请求率 schbench 前台＋sysbench CPU 后台”的稳态混合负载：先满足前台约束，再优化后台吞吐，不做加权总分。内核编译后台、阶段变化和动态 Agent 验证留到后续。
+代码、配置、测试、README 和 `bench/`放在 `Mixbench/`，本文路径相对此目录，先进入后执行；本文档留在项目根目录。首版实现“固定请求率 schbench 前台＋sysbench CPU 后台”的稳态混合负载：**先满足前台约束，再优化后台吞吐**，不做加权总分。
 
 ## 入口与配置
 

@@ -51,7 +51,8 @@ class BatchScheduler(Scheduler):
             guard = [executable, "--no-ask-password", "--what=idle:sleep", "--mode=block",
                      f"--who={self.workload_name}",
                      "--why=" + {"compiletest": "kernel compilation benchmark in progress",
-                                  "schtest": "schbench benchmark in progress"}.get(
+                                  "schtest": "schbench benchmark in progress",
+                                  "mixtest": "mixed workload benchmark in progress"}.get(
                                       self.workload_name, "hackbench benchmark in progress"), "--"]
             command = [*guard, *command]
             self.info["sleep_inhibition"] = {"what": "idle:sleep", "mode": "block",

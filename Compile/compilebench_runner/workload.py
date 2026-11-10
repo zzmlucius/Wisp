@@ -251,6 +251,8 @@ def measure(command, directory, environment, log_path, sample_path, scheduler,
                     os.close(pidfd)
                 if start is not None and end is not None:
                     result["wall_s"] = end - start
+                    notes["started_monotonic_s"] = start
+                    notes["finished_monotonic_s"] = end
                 # An observation can overlap exit; only persist readings whose
                 # temperature timestamp is inside the measured make window.
                 kept = [sample for sample in observations

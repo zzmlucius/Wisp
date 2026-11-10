@@ -72,7 +72,7 @@ class BenchmarkTests(unittest.TestCase):
 
     def run_fake(self, cls=FakeScheduler):
         cfg = load_config(self.config_path)
-        with patch("compilebench_runner.cli.Scheduler", cls):
+        with patch("compilebench.cli.Scheduler", cls):
             return experiment(cfg)
 
     def test_single_build_is_silent_and_records_current_scheduler(self):
@@ -94,7 +94,7 @@ class BenchmarkTests(unittest.TestCase):
         scheduler = FakeScheduler()
         scheduler.state.update(state="enabled", ops="lavd_1.1.4_x86_64_unknown_linux_gnu", switch_all="1")
         initial = scheduler.snapshot()
-        with patch("compilebench_runner.cli.Scheduler", return_value=scheduler):
+        with patch("compilebench.cli.Scheduler", return_value=scheduler):
             self.assertEqual(experiment(load_config(self.config_path)), 0)
         row, = self.rows()
         self.assertEqual(row["policy"], "scx_lavd")
@@ -230,7 +230,7 @@ class BenchmarkTests(unittest.TestCase):
         cfg = load_config(self.config_path)
         cfg["cooldown_s"] = 0.4
         start = time.monotonic()
-        with patch("compilebench_runner.cli.Scheduler", FakeScheduler), contextlib.redirect_stdout(io.StringIO()):
+        with patch("compilebench.cli.Scheduler", FakeScheduler), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(experiment(cfg), 0)
         elapsed = time.monotonic() - start
         row, = self.rows()
@@ -287,7 +287,7 @@ class BenchmarkTests(unittest.TestCase):
         control.install()
         try:
             cfg = load_config(self.config_path)
-            with patch("compilebench_runner.cli.Scheduler", FakeScheduler), patch("compilebench_runner.cli.write_json", persist), contextlib.redirect_stdout(io.StringIO()):
+            with patch("compilebench.cli.Scheduler", FakeScheduler), patch("compilebench.cli.write_json", persist), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(experiment(cfg, control), 130)
         finally:
             control.restore()
@@ -307,7 +307,7 @@ class BenchmarkTests(unittest.TestCase):
             return pid
 
         scheduler = FakeScheduler()
-        with patch("compilebench_runner.workload.os.fork", fork):
+        with patch("compilebench.workload.os.fork", fork):
             outcome, _, interrupted = measure([sys.executable, "-c", "pass"], self.base,
                 dict(os.environ), self.base / "build.log", self.base / "samples.csv", scheduler,
                 scheduler.initial(), None, power_state(), interrupts=control)
@@ -324,7 +324,7 @@ class BenchmarkTests(unittest.TestCase):
             return 40.0
 
         scheduler = FakeScheduler()
-        with patch("compilebench_runner.workload.temperature", sensor):
+        with patch("compilebench.workload.temperature", sensor):
             outcome, notes, _ = measure([sys.executable, "-c", "import time;time.sleep(0.08)"], self.base,
                 dict(os.environ), self.base / "build.log", self.base / "samples.csv", scheduler,
                 scheduler.initial(), self.base / "sensor", power_state(), interval=0.05)
@@ -349,7 +349,7 @@ class BenchmarkTests(unittest.TestCase):
         def path(value):
             return supply_root if str(value) == "/sys/class/power_supply" else Path(value)
 
-        with patch("compilebench_runner.system.Path", path):
+        with patch("compilebench.system.Path", path):
             before = power_state()
             (supply_root / "mouse/online").write_text("0")
             self.assertEqual(before, power_state())
@@ -366,11 +366,11 @@ class BenchmarkTests(unittest.TestCase):
     def test_delegation_fallback_requires_exact_user_unit_controlgroup(self):
         path = Path('/sys/fs/cgroup/user.slice/example.service')
         result = subprocess.CompletedProcess([], 0, 'Delegate=yes\nControlGroup=/user.slice/example.service\n', '')
-        with patch('compilebench_runner.metrics.os.getxattr', side_effect=OSError(61, 'no data')):
-            with patch('compilebench_runner.metrics.subprocess.run', return_value=result):
+        with patch('compilebench.metrics.os.getxattr', side_effect=OSError(61, 'no data')):
+            with patch('compilebench.metrics.subprocess.run', return_value=result):
                 self.assertTrue(is_delegated(path))
             result.stdout = 'Delegate=yes\nControlGroup=/user.slice/some-other.service\n'
-            with patch('compilebench_runner.metrics.subprocess.run', return_value=result):
+            with patch('compilebench.metrics.subprocess.run', return_value=result):
                 self.assertFalse(is_delegated(path))
 
     def test_epp_change_is_logged_without_invalidating_balanced_mode(self):
@@ -378,7 +378,7 @@ class BenchmarkTests(unittest.TestCase):
                     "/sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference": "balance_power"}
         current = {**baseline, "/sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference": "balance_performance"}
         scheduler = FakeScheduler()
-        with patch("compilebench_runner.workload.power_state", return_value=current):
+        with patch("compilebench.workload.power_state", return_value=current):
             outcome, notes, _ = measure([sys.executable, "-c", "import time;time.sleep(0.15)"], self.base,
                 dict(os.environ), self.base / "build.log", self.base / "samples.csv", scheduler,
                 scheduler.initial(), None, baseline, interval=0.05)
@@ -402,7 +402,7 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertIn(key, power_error(baseline, current, "测试"))
                 self.assertIn(key, power_differences(baseline, current))
                 scheduler = FakeScheduler()
-                with patch("compilebench_runner.workload.power_state", return_value=current):
+                with patch("compilebench.workload.power_state", return_value=current):
                     outcome, _, _ = measure([sys.executable, "-c", "pass"], self.base,
                         dict(os.environ), self.base / "build.log", self.base / "samples.csv", scheduler,
                         scheduler.initial(), None, baseline, interval=0.05)
@@ -416,7 +416,7 @@ class BenchmarkTests(unittest.TestCase):
         changed = {"desktop_profile": "power-saver"}
         scheduler = FakeScheduler()
         command = [sys.executable, "-c", f"import time,pathlib;time.sleep(0.06);pathlib.Path({str(marker)!r}).touch();time.sleep(0.12)"]
-        with patch("compilebench_runner.workload.power_state", side_effect=lambda: changed if marker.exists() else baseline):
+        with patch("compilebench.workload.power_state", side_effect=lambda: changed if marker.exists() else baseline):
             outcome, notes, _ = measure(command, self.base, dict(os.environ), self.base / "build.log",
                 self.base / "samples.csv", scheduler, scheduler.initial(), None, baseline, interval=0.03)
         self.assertFalse(outcome["valid"])
