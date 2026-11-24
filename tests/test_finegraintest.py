@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import Finegraintest as fine
+from Tests import Finegraintest as fine
 
 
 class FinegrainTests(unittest.TestCase):

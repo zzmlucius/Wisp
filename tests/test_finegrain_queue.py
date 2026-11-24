@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from Finegraintest import queue
+from Tests.Finegraintest import queue
 
 
 class FinegrainQueueTests(unittest.TestCase):

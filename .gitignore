@@ -21,6 +21,7 @@ finegrain-workload-status.jsonl
 /Agent/Collector/result/
 /SUM/
 /daily_log/
+/OLDtest/
 
 # Local benchmark settings and copies saved with runs
 compiletest.json

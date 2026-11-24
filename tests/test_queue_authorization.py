@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from Finegraintest import queue
+from Tests.Finegraintest import queue
 from compilebench_runner import control
 
 

@@ -14,12 +14,15 @@ import subprocess
 import sys
 import time
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / 'Bench'
-for directory in (BENCH, *(BENCH / name for name in ('Compile', 'Schbench', 'Mixbench'))):
-    sys.path.insert(0, str(directory))
+for name in ('Compile', 'Schbench', 'Mixbench'):
+    sys.path.insert(0, str(BENCH / name))
 
-import finegrain_queue as queue
+if __package__:
+    from . import finegrain_queue as queue
+else:
+    import finegrain_queue as queue
 
 from compilebench_runner.cli import acquire_lock, scheduler_specs
 from compilebench_runner.control import POLICIES

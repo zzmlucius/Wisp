@@ -22,7 +22,7 @@ Mixbench 同时运行前台 schbench 和后台 sysbench CPU。前台按固定 RP
 
 ## Finegraintest
 
-[Finegraintest.py](Finegraintest.py) 复用本机 Mixbench 配置，对前台线程、后台线程和目标 RPS 做全组合测试。除表中覆盖项外，其余负载参数与判定规则继承 Mixbench。
+[Finegraintest.py](Tests/Finegraintest.py) 复用本机 Mixbench 配置，对前台线程、后台线程和目标 RPS 做全组合测试。除表中覆盖项外，其余负载参数与判定规则继承 Mixbench。入口和队列模块的分工见 [Tests 目录说明](Tests/README.md)。
 
 | 配置 | 值 |
 | --- | --- |
@@ -40,9 +40,9 @@ Mixbench 同时运行前台 schbench 和后台 sysbench CPU。前台按固定 RP
 
 ```sh
 make -C Agent/Collector bpf      # 构建采集器和调度探针
-./Finegraintest.py --check      # 检查配置和依赖
-./Finegraintest.py --check-ebpf # 实跑一次，检查调度指标和探针卸载
-./Finegraintest.py              # 运行全量队列
+./Tests/Finegraintest.py --check      # 检查配置和依赖
+./Tests/Finegraintest.py --check-ebpf # 实跑一次，检查调度指标和探针卸载
+./Tests/Finegraintest.py              # 运行全量队列
 ```
 
 基准成绩写入 `summary.csv`，逐次负载向量另存为 `finegrain-workload.csv`，采样状态和元数据使用同一文件名前缀。新结果位于 `Bench/Mixbench/bench/results/finegraintest/`。本机已有的两批合并数据位于 `Agent/Collector/result/`。

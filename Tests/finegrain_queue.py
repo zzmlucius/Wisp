@@ -18,7 +18,7 @@ from compilebench_runner.system import digest, machine_info, power_error, power_
 from mixbench_runner import cli as mixed
 from mixbench_runner.configuration import commands
 
-BENCH = Path(__file__).resolve().parent
+BENCH = Path(__file__).resolve().parent.parent / 'Bench'
 ROUNDS_PER_BATCH = 3
 MIN_FREE_BYTES = 1024**3
 

@@ -32,4 +32,4 @@ make -C Agent/Collector bpf
 
 只有在同一内核和所有待测调度器上确认 `update_rq_clock` 可附着、CO-RE 字段可读、`rq->nr_running` 语义符合预期后，才设置 `collector.runqueue_verified=true`。没有观察到所选 CPU 的新值时，运行队列列留空。
 
-Fedora 44（内核 7.3.3）短混压已验证。普通进程作用域可取得全机、选定 CPU 和配置设备的基础指标。用户级 systemd 委派 cgroup 额外提供前后台 CPU 时间和 PSI，共取得 14 项。授权模式已在 Finegraintest 正式运行中采得 4 项调度事件指标。可用 `./Finegraintest.py --check-ebpf` 验证采集和卸载。openEuler 实机和运行队列统计口径待验证。
+Fedora 44（内核 7.3.3）短混压已验证。普通进程作用域可取得全机、选定 CPU 和配置设备的基础指标。用户级 systemd 委派 cgroup 额外提供前后台 CPU 时间和 PSI，共取得 14 项。授权模式已在 Finegraintest 正式运行中采得 4 项调度事件指标。可从 Wisp 根目录用 `./Tests/Finegraintest.py --check-ebpf` 验证采集和卸载。openEuler 实机和运行队列统计口径待验证。

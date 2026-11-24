@@ -34,7 +34,7 @@ int MonitorLoopNs(uint64_t period, MonitorContext *ctx, MonitorSink sink, void *
         SampleMeta meta;
         
         // Collect workload data using linux API and eBPF
-        if (snaNp(ctx, vector, &meta) < 0)
+        if (snap(ctx, vector, &meta) < 0)
             return -1;
 
         // replace sink with write_sample,
