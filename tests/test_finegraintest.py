@@ -20,16 +20,17 @@ class FinegrainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             def load(path):
-                return copy.deepcopy(base) if path.name == 'mixtest.json' else json.loads(path.read_text())
+                return copy.deepcopy(base) if path == fine.SETTINGS else json.loads(path.read_text())
             with patch.object(fine, 'load_config', side_effect=load), \
                  patch.object(fine.collector, 'prepare', return_value={'binary': '/bin/false', 'files': [str(fine.BPF_OBJECT)]}), \
                  patch.object(fine, 'scheduler_specs', return_value={}), \
-                 patch.object(fine.midnight, 'commands', return_value={}):
+                 patch.object(fine.queue, 'commands', return_value={}):
                 jobs = fine.prepare_jobs(root, {'AC/online': '1'})
 
             self.assertEqual(base, original)
+            self.assertEqual(fine.RPS_VALUES, (250, 500, 750, 1000, 1250, 1500, 1750, 2000))
             self.assertEqual(len({j['name'] for j in jobs}), len(jobs))
-            self.assertEqual(len(jobs) * len(fine.POLICIES) * 3, 432)
+            self.assertEqual(len(jobs) * len(fine.POLICIES) * 3, 864)
             self.assertEqual([(j['config']['front']['worker_threads'],
                                j['config']['back']['threads'], j['config']['rps']) for j in jobs],
                              list(product(fine.THREADS, fine.THREADS, fine.RPS_VALUES)))

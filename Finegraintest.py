@@ -4,8 +4,6 @@ import argparse
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import fcntl
-import importlib.machinery
-import importlib.util
 from itertools import product
 import json
 import os
@@ -17,11 +15,11 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parent
-loader = importlib.machinery.SourceFileLoader('finegrain_midnight', str(ROOT / 'midnighttest'))
-spec = importlib.util.spec_from_loader(loader.name, loader)
-midnight = importlib.util.module_from_spec(spec)
-loader.exec_module(midnight)
-night = midnight.night
+BENCH = ROOT / 'Bench'
+for directory in (BENCH, *(BENCH / name for name in ('Compile', 'Schbench', 'Mixbench'))):
+    sys.path.insert(0, str(directory))
+
+import finegrain_queue as queue
 
 from compilebench_runner.cli import acquire_lock, scheduler_specs
 from compilebench_runner.control import POLICIES
@@ -34,21 +32,23 @@ from schbench_runner.cli import effective
 
 
 THREADS = (4, 8, 14)
-RPS_VALUES = (250, 500, 750, 1000)
+RPS_VALUES = tuple(range(250, 2001, 250))
 RUNTIME_S = 30
 COOLDOWN_S = 30
 BATCH_REST_S = 45
 PREFIX = 'finegrain-workload'
-BPF_OBJECT = ROOT / 'Collector/bench/build/scheduler.bpf.o'
+ENTRYPOINT = Path(__file__).resolve()
+SETTINGS = BENCH / 'Mixbench/mixtest.json'
+BPF_OBJECT = collector.SOURCE / 'bench/build/scheduler.bpf.o'
 
 
-def prepare_jobs(directory, power, rps_values=RPS_VALUES):
-    base = load_config(ROOT / 'Mixbench/mixtest.json')
+def prepare_jobs(directory, power):
+    base = load_config(SETTINGS)
     base['collector'] = {**base.get('collector', {}), 'bpf_object': str(BPF_OBJECT),
                          'runqueue_verified': False}
     native_collect = {**collector.prepare(base), 'prefix': PREFIX, 'authorized': True}
     if str(BPF_OBJECT) not in native_collect['files'] or native_collect.get('probe_build_error'):
-        raise RuntimeError('需要现有的调度探针和 libbpf 采集器，请先执行 make -C Collector bpf')
+        raise RuntimeError('需要现有的调度探针和 libbpf 采集器，请先执行 make -C Agent/Collector bpf')
     settings = effective(base)
     settings.update(runtime_s=RUNTIME_S, cooldown_s=COOLDOWN_S,
                     schedulers=scheduler_specs(base), results_dir=str(directory / 'results'))
@@ -56,17 +56,17 @@ def prepare_jobs(directory, power, rps_values=RPS_VALUES):
     inputs.mkdir()
     (directory / 'logs').mkdir()
     jobs = []
-    for front, back, rps in product(THREADS, THREADS, rps_values):
+    for front, back, rps in product(THREADS, THREADS, RPS_VALUES):
         settings['front']['worker_threads'] = front
         settings['back']['threads'] = back
         settings['rps'] = rps
         name = result_directory_name(settings, power, '').rstrip('_')
         path = inputs / (name + '.json')
-        night.write_status(path, settings)
+        queue.write_status(path, settings)
         cfg = load_config(path)
         cfg.update(_collector=native_collect, _collector_required=True)
         jobs.append({'name': name, 'config_file': str(path), 'config': cfg,
-                     'command': midnight.commands(cfg, directory / 'results' / name / 'run-NNN' / 'POLICY')})
+                     'command': queue.commands(cfg, directory / 'results' / name / 'run-NNN' / 'POLICY')})
     return jobs
 
 
@@ -154,8 +154,8 @@ def restore_noninteractive(previous):
         os.environ['WISP_SUDO_NONINTERACTIVE'] = previous
 
 
-def main(argv=None, *, rps_values=RPS_VALUES, entrypoint=Path(__file__), round_progress=False):
-    label = entrypoint.name
+def main(argv=None):
+    label = ENTRYPOINT.name
     parser = argparse.ArgumentParser(description='运行细粒度 Mixbench 参数矩阵')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--check', action='store_true',
@@ -182,23 +182,23 @@ def main(argv=None, *, rps_values=RPS_VALUES, entrypoint=Path(__file__), round_p
             interrupts.install()
             stack.callback(interrupts.restore)
             stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
-            directory = ROOT / 'Mixbench/bench/results' / entrypoint.stem.lower() / f'{stamp}-{os.getpid()}'
+            directory = BENCH / 'Mixbench/bench/results/finegraintest' / f'{stamp}-{os.getpid()}'
             directory.mkdir(parents=True)
             print(f'队列与结果目录 {directory}', flush=True)
 
-            guard = stack.enter_context(midnight.DesktopGuard(label))
-            jobs = prepare_jobs(directory, power_state(), rps_values)
+            guard = stack.enter_context(queue.DesktopGuard(label))
+            jobs = prepare_jobs(directory, power_state())
             cfg = jobs[0]['config']
-            report = midnight.preflight(jobs, directory, label=label, batch_rest_s=BATCH_REST_S, extra_files=(
-                Path(__file__).resolve(), entrypoint.resolve(), ROOT / 'Mixbench/mixtest.json', *cfg['_collector']['files']))
+            report = queue.preflight(jobs, directory, label=label, batch_rest_s=BATCH_REST_S, extra_files=(
+                ENTRYPOINT, SETTINGS, *cfg['_collector']['files']))
             report.update(inhibition=dict(guard.info), collector=check_collector(cfg, directory),
-                          matrix={'front_workers': THREADS, 'back_threads': THREADS, 'rps': rps_values,
+                          matrix={'front_workers': THREADS, 'back_threads': THREADS, 'rps': RPS_VALUES,
                                   'policies': list(POLICIES), 'front_runtime_s': RUNTIME_S,
                                   'back_runtime_s': RUNTIME_S})
-            midnight.verify_queue(report, directory, guard)
-            night.write_status(directory / 'preflight.json', report)
+            queue.verify_queue(report, directory, guard)
+            queue.write_status(directory / 'preflight.json', report)
             if args.check:
-                night.write_status(directory / 'status.json', {'status': 'checked', 'jobs': [
+                queue.write_status(directory / 'status.json', {'status': 'checked', 'jobs': [
                     {'name': j['name'], 'config_file': j['config_file']} for j in jobs]})
                 print(f"预检通过，共 {report['batch_count']} 批、{report['attempt_count']} 次。", flush=True)
                 return 0
@@ -211,24 +211,23 @@ def main(argv=None, *, rps_values=RPS_VALUES, entrypoint=Path(__file__), round_p
                 print(f"{report['batch_count']} 批、{report['attempt_count']} 次，预计至少 "
                       f"{report['minimum_time_s'] / 3600:.1f} 小时。启动时可能要求一次 sudo 密码。", flush=True)
             log = stack.enter_context((directory / 'authorization.log').open('a', buffering=1))
-            authorization = stack.enter_context(night.Authorization(log))
-            midnight.verify_queue(report, directory, guard)
+            authorization = stack.enter_context(queue.Authorization(log))
+            queue.verify_queue(report, directory, guard)
             report['collector']['authorized_probes'] = check_attachment(cfg, directory, interrupts)
-            night.write_status(directory / 'preflight.json', report)
+            queue.write_status(directory / 'preflight.json', report)
             if args.check_ebpf:
                 code = check_one_workload(cfg, directory, interrupts)
-                night.write_status(directory / 'status.json', {'status': 'ebpf_verified'})
+                queue.write_status(directory / 'status.json', {'status': 'ebpf_verified'})
                 return code
-            midnight.scheduler_preflight(cfg, directory / 'scheduler-preflight', interrupts)
+            queue.scheduler_preflight(cfg, directory / 'scheduler-preflight', interrupts)
             authorization.check()
-            midnight.verify_queue(report, directory, guard)
-            return midnight.run_queue(jobs, directory, authorization, guard, report, interrupts,
-                                      round_progress=round_progress)
+            queue.verify_queue(report, directory, guard)
+            return queue.run_queue(jobs, directory, authorization, guard, report, interrupts)
     except (KeyboardInterrupt, Exception) as exc:
         cancelled = isinstance(exc, KeyboardInterrupt)
         error = '用户中断' if cancelled else str(exc)
         if directory is not None and not (directory / 'status.json').exists():
-            night.write_status(directory / 'status.json', {'status': 'interrupted' if cancelled else 'failed',
+            queue.write_status(directory / 'status.json', {'status': 'interrupted' if cancelled else 'failed',
                          'phase': 'preflight_or_authorization', 'error': error})
         if not cancelled:
             print(f'{label} 未能完成：{error}', file=sys.stderr)
@@ -240,7 +239,7 @@ def main(argv=None, *, rps_values=RPS_VALUES, entrypoint=Path(__file__), round_p
                 try:
                     data = json.loads(status.read_text())
                     data['inhibition'] = dict(guard.info)
-                    night.write_status(status, data)
+                    queue.write_status(status, data)
                 except (OSError, ValueError) as exc:
                     print(f'保存防熄屏收尾状态失败：{exc}', file=sys.stderr)
 

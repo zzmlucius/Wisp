@@ -15,10 +15,10 @@ workload-status.jsonl
 finegrain-workload.csv
 finegrain-workload-meta.json
 finegrain-workload-status.jsonl
-/Compile/**/builds/
+/Bench/Compile/**/builds/
 
 # Exported test results and local measurement logs
-/Collector/result/
+/Agent/Collector/result/
 /SUM/
 /daily_log/
 
