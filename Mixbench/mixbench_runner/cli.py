@@ -20,14 +20,27 @@ from compilebench_runner.system import digest, machine_info, read, sensor_path, 
 from compilebench_runner.workload import SAMPLE_FIELDS, measure
 from schbench_runner.cli import append_error, effective
 
+from . import collector
 from .configuration import active_sides, commands, load_config
-from .observation import apply_running_wakeup, metric_policy, summarize_trace, trace_environment
+from .observation import metric_policy
 from .results import FIELDS, TIMER_SOURCES, TIMING_VALIDATION, assess, baseline_ratios, finalize_validity, parse_back, parse_front, summarize, synchronization, validity_rule
 
 PROJECT = Path(__file__).resolve().parents[1]
 
 
-def save_inputs(cfg, directory, initial):
+def result_directory_name(cfg, power, identity):
+    """Label frozen workload settings and initial host power; retain unique identity."""
+    online = [value for key, value in power.items() if key.endswith('/online')]
+    supply = '1' if '1' in online else '0' if online and all(value == '0' for value in online) else 'unknown'
+    front = cfg['front']['worker_threads'] if cfg['case'] != 'back' else 'na'
+    back = cfg['back']['threads'] if cfg['case'] != 'front' else 'na'
+    rps = cfg.get('rps') if cfg['case'] != 'back' else 'na'
+    if rps is None:
+        rps = 'best'
+    return f"{front}-{back}-{rps}-{supply}_{identity}"
+
+
+def save_inputs(cfg, directory, initial, machine=None):
     write_json(directory / "mixtest.json", effective(cfg))
     raw = Path(cfg["_config_path"]).read_bytes()
     if hashlib.sha256(raw).hexdigest() != cfg["_config_sha256"]:
@@ -40,13 +53,14 @@ def save_inputs(cfg, directory, initial):
         for path in package.glob("*.py")}
     inputs.update({cfg[side]["program"]: cfg["_program_sha256"][side] for side in active_sides(cfg["case"])})
     inputs.update(cfg.get("_observation_files", {}))
+    inputs.update({path: digest(path) for path in cfg.get("_collector", {}).get("files", [])})
     if cfg["case"] != "back":
         inputs[cfg["front"]["provenance"]] = cfg["_front"]["_provenance_sha256"]
     snapshot = {"created_utc": datetime.now(timezone.utc).isoformat(), "parameters": effective(cfg),
         "settings_sha256": cfg["_config_sha256"], "effective_settings_sha256": digest(directory / "mixtest.json"),
         "program_sha256": cfg["_program_sha256"], "versions": cfg["_versions"], "frozen_files": inputs,
         "timing_validation": dict(TIMING_VALIDATION),
-        "machine": machine_info(), "online_cpus": read("/sys/devices/system/cpu/online"), "scheduler": initial,
+        "machine": machine if machine is not None else machine_info(), "online_cpus": read("/sys/devices/system/cpu/online"), "scheduler": initial,
         "environment": {**build_environment(cfg), "LC_ALL": "C", "LANG": "C"},
         "temperature_sensor": {"path": str(sensor) if sensor else None,
             "driver": read(sensor.parent / "name") if sensor else None,
@@ -124,24 +138,54 @@ def run_attempt(cfg, directory, snapshot, sensor, scheduler, initial, policy, ru
         verify()
         scheduler.verify(expected)
         spec = {"commands": cmd, "cpus": cfg["cpus"], "sample_interval_s": cfg["sample_interval_s"],
-                "sensor": str(sensor) if sensor else None, "expected_scheduler": expected}
-        if cfg.get("wakeup_observation", {}).get("enabled"):
-            spec["front_environment"] = trace_environment(attempt, cfg)
+                "sensor": str(sensor) if sensor else None, "expected_scheduler": expected,
+                "collector": cfg.get("_collector")}
         write_json(attempt / "launch.json", spec)
         launch_sha = digest(attempt / "launch.json")
+        sampler_processes = []
+        collector_error = None
+        authorized = bool((spec["collector"] or {}).get("authorized"))
+        request = attempt / "collector-request.json"
+        reply = attempt / "collector-ready.json"
+
         def verify_launch():
+            nonlocal collector_error
             verify()
             if digest(attempt / "launch.json") != launch_sha:
                 raise ConfigError("本次原生命令配置在门控后变化")
+            if authorized and request.exists() and not reply.exists() and not interrupts.requested:
+                try:
+                    collector.start(sampler_processes, spec, attempt, json.loads(request.read_text()), interrupts)
+                except KeyboardInterrupt:
+                    collector_error = "授权采集器启动时收到中断"
+                except (OSError, ValueError, RuntimeError) as exc:
+                    collector_error = str(exc)
+                write_json(reply, {"error": collector_error})
         evidence_path = attempt / "execution.json"
         worker = [sys.executable, str(PROJECT / "mixbench_runner/worker.py"), str(attempt / "launch.json"), str(evidence_path)]
-        outcome, notes, cancelled = measure(worker, attempt, snapshot["environment"],
-            attempt / "prepare.log", attempt / "samples.csv", scheduler, expected, sensor,
-            snapshot["machine"]["power"], cfg["sample_interval_s"], cfg["cgroup_parent"], interrupts,
-            verify_parameters=verify_launch, cpu_affinity=cfg["cpus"], workload_label="mixed workload", timeout_s=cfg["timeout_s"])
+        try:
+            outcome, notes, cancelled = measure(worker, attempt, snapshot["environment"],
+                attempt / "prepare.log", attempt / "samples.csv", scheduler, expected, sensor,
+                snapshot["machine"]["power"], cfg["sample_interval_s"], cfg["cgroup_parent"], interrupts,
+                verify_parameters=verify_launch, cpu_affinity=cfg["cpus"], workload_label="mixed workload", timeout_s=cfg["timeout_s"])
+        finally:
+            with interrupts.defer():
+                for process in sampler_processes:
+                    try:
+                        code = collector.stop(process)
+                        if code and not collector_error and not interrupts.requested:
+                            collector_error = f"授权采集器退出码 {code}，见 collector.log"
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        collector_error = f"授权采集器收尾失败: {exc}"
         row.update(outcome)
         details.update(notes)
         evidence = json.loads(evidence_path.read_text()) if evidence_path.exists() else {}
+        if collector_error:
+            evidence["collector_error"] = collector_error
+        if authorized:
+            evidence["collector_interrupted"] = cancelled or interrupts.requested
+            if evidence.get("collector_error") and not evidence["collector_interrupted"]:
+                fatal = evidence["collector_error"]
         details["execution"] = evidence
         details["exit_codes"] = {side: child.get("exit_code") for side, child in evidence.get("children", {}).items()}
         if evidence.get("error"):
@@ -189,26 +233,31 @@ def run_attempt(cfg, directory, snapshot, sensor, scheduler, initial, policy, ru
                 except Exception as exc:
                     fatal = str(exc)
                     append_error(row, fatal)
-            if cfg.get("wakeup_observation", {}).get("enabled"):
-                try:
-                    details["wakeup_observation"] = summarize_trace(attempt)
-                except Exception as exc:
-                    details["wakeup_observation"] = {"status": "unavailable", "capture_complete": False, "error": str(exc)}
-                issue = apply_running_wakeup(row, details, details["wakeup_observation"])
-                if issue:
-                    append_error(row, issue)
             cancelled = cancelled or interrupts.requested
             if cancelled:
                 append_error(row, "用户中断")
             finalize_validity(row, details, cfg)
             details["constraints"] = assess(row, cfg)
+            if cfg.get("_collector"):
+                try:
+                    details["workload_collection"] = collector.finalize(attempt, details.get("execution", {}),
+                        row["valid"], details.get("execution", {}).get("collector_error"),
+                        cfg["_collector"].get("prefix", "workload"),
+                        cfg["_collector"].get("authorized", False))
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    details["workload_collection"] = {"status": "failed", "error": str(exc)}
+            collection = details.get("workload_collection", {})
+            launched = details.get("execution", {}).get("released_monotonic_s") is not None
+            if cfg.get("_collector_required") and launched and not cancelled and not fatal and (
+                    collection.get("status") != "complete" or not collection.get("samples")):
+                fatal = "本次采集没有可交付的样本，见 attempt.json 和 collector.log"
             details["baselines"] = baseline_ratios(cfg, snapshot, row)
             details["result"] = row
             write_json(attempt / "attempt.json", details)
     return row, cancelled, fatal, details, str(attempt.relative_to(directory))
 
 
-def experiment(cfg, interrupts=None, rounds=None, seed=None):
+def experiment(cfg, interrupts=None, rounds=None, seed=None, *, on_round_complete=None):
     interrupts = interrupts or Interrupts()
     observer = Scheduler()
     initial = observer.initial()
@@ -224,7 +273,11 @@ def experiment(cfg, interrupts=None, rounds=None, seed=None):
         if rounds is not None:
             rng.shuffle(order)
         orders.append(order)
-    directory = Path(cfg["results_dir"]) / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + f"-{os.getpid()}")
+    collector_options = cfg.get("_collector") or collector.prepare(cfg)
+    cfg = {**cfg, "_collector": collector_options}
+    machine = machine_info()
+    identity = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + f"-{os.getpid()}"
+    directory = Path(cfg["results_dir"]) / result_directory_name(cfg, machine["power"], identity)
     directory.mkdir(parents=True)
     from .cleanup import register_root
     register_root(Path(cfg["results_dir"]))
@@ -237,7 +290,7 @@ def experiment(cfg, interrupts=None, rounds=None, seed=None):
                 "orders": orders, "initial_scheduler": initial, "attempts": [], "status": "running",
                 "started_utc": datetime.now(timezone.utc).isoformat(),
                 "metrics": {"avg_rps": "前台整次平均请求/秒", "request_p99_us": "前台请求 p99，µs",
-                    "wakeup_p99_us": "前台运行阶段唤醒 p99（stopping=0），µs" if cfg.get("wakeup_observation", {}).get("enabled") else "前台原生全量唤醒 p99，µs",
+                    "wakeup_p99_us": "前台原生全量唤醒 p99，µs",
                     "back_events_s": "后台原生 CPU speed events/s，不用配置时长重算",
                     "wall_s": "首个原生 exec 紧前至最后一个退出观测，单调时钟秒",
                     "cpu_time_s": "双方完整进程树和协调器的父 cgroup CPU 秒",
@@ -245,7 +298,7 @@ def experiment(cfg, interrupts=None, rounds=None, seed=None):
                     "temperature": "同一传感器，°C；峰值仅为正式负载期间采样最高值"},
                 "native_timing": TIMER_SOURCES, "synchronization": cfg["synchronization"],
                 "timing_validation": dict(TIMING_VALIDATION),
-                "wakeup_metric": metric_policy(bool(cfg.get("wakeup_observation", {}).get("enabled"))),
+                "wakeup_metric": metric_policy(False),
                 "commands": commands(cfg, directory / "run-NNN/POLICY")}
 
     rows, assessments, cancelled, fatal = [], [], False, None
@@ -255,7 +308,7 @@ def experiment(cfg, interrupts=None, rounds=None, seed=None):
         writer.writeheader()
         summary.flush()
         try:
-            snapshot, sensor = save_inputs(cfg, directory, initial)
+            snapshot, sensor = save_inputs(cfg, directory, initial, machine=machine)
             metadata["snapshot"] = "snapshot.json"
             if rounds is not None:
                 scheduler.open()
@@ -280,6 +333,8 @@ def experiment(cfg, interrupts=None, rounds=None, seed=None):
                         break
                 if cancelled or fatal:
                     break
+                if on_round_complete is not None:
+                    on_round_complete(run, len(orders))
         except KeyboardInterrupt:
             cancelled = True
         except Exception as exc:
@@ -308,7 +363,7 @@ def parser():
     p.add_argument("-n", "--rps", type=int, help="覆盖独立预实验确定的统一前台 RPS；也可简写为 -1000")
     p.add_argument("--bg-threads", type=int, help="覆盖后台线程数")
     p.add_argument("--output", type=Path, help="结果根目录；相对于调用时工作目录")
-    p.add_argument("--observe-wakeup", action="store_true", help="逐次唤醒观测；汇总 p99 仅统计 stopping=0，原始记录保留")
+    p.add_argument("--observe-wakeup", action="store_true", help="兼容旧命令；当前使用原版 schbench 全量统计，此参数不启用观测或筛选")
     return p
 
 

@@ -16,7 +16,7 @@
 | 前后台各自运行时长 `runtime_s` | 60 秒，并发运行 |
 | 后台 `threads` / `cpu_max_prime` | 14 / 20000 |
 
-这是用户指定的首版待实测场景，不代表性能已经达标。前台保留原来的 14 个 worker；四种调度器共用同一参数和阈值，不自动调整。mixed 必须有有效的 RPS 和延迟上限；显式设为 `null` 时在启动前报错。front/back 可另批单独运行用于预实验和基线。
+这是用户指定的首版待实测场景，不代表性能已经达标。前台使用 14 个 worker；四种调度器共用同一参数和阈值，不自动调整。mixed 必须有有效的 RPS 和延迟上限；显式设为 `null` 时在启动前报错。front/back 可另批单独运行用于预实验和基线。
 
 ```sh
 cd ~/Documents/code/Wisp/Mixbench
@@ -29,9 +29,11 @@ cd ~/Documents/code/Wisp/Mixbench
 
 默认时长 60 秒，前台 `-m 1 -t 14 -r 60 -F 256 -n 5 -s 100 -R 1000 -w 0 -z 0`。关闭内部预热/周期清零/自动调压，`-i 61` 避免把周期 p99 当作独立最终分布。
 
+每次尝试会额外保存 19 维 Wisp 负载向量。构建、采样字段和产物见 [Wisp 采集层](../Collector/README.md)。
+
 本机后台实际命令为 `sysbench cpu --threads=14 --cpu-max-prime=20000 --time=60 --events=0 --rate=0 --report-interval=1 run`，自然运行到时长结束。本地 1.0.20 的 help 未声明 `--warmup-time`，实测传入会报 invalid option，因此不传该参数，原生 CPU 测试直接计时，不增加额外预热；若本地 help 支持该参数则显式传 `--warmup-time=0`。选择依据写入 `snapshot.json.versions.back.warmup`，实际命令写入 attempt。1 秒输出只保留日志，主要指标取最终 CPU speed 的 events/s；不对各秒数据求均值替代它。
 
-当前可用 CPU 为 4–13，共 10 个；配置共享该范围。前台 14 worker、后台 14 线程保留任务规定的起点，存在超额并发，不意味着使用 14 个 CPU。若改为 7/14/28 个后台线程，应分别成批。两侧继承普通优先级，共用同一 CPU 范围，不改变 nice、权重或配额，不清缓存。迁移机器后先核对 CPU 范围。
+当前可用 CPU 为 4–13，共 10 个；配置共享该范围。前台 14 worker、后台 14 线程，共享这 10 个逻辑 CPU，存在超额并发。若改为 7/14/28 个后台线程，应分别成批。两侧继承普通优先级，共用同一 CPU 范围，不改变 nice、权重或配额，不清缓存。迁移机器后先核对 CPU 范围。
 
 ## 运行
 
@@ -49,6 +51,13 @@ cd ~/Documents/code/Wisp/Mixbench
 
 `--rps`、`--bg-threads`、`--output` 覆盖生效配置并保存，不修改输入文件。四策略使用同一目标 RPS，结果仍保存在 `bench/results/<唯一批次>/`。未设 RPS 的 front 是尽力模式；设 RPS 的 front 是固定请求率模式，两者不可直接混作基线。
 
+结果批次目录命名为 `前台worker数-后台线程数-RPS-供电状态_UTC时间戳-PID`，例如
+`8-10-500-0_20261112T014507.999241Z-527254` 表示前台 8、后台 10、500 RPS、启动时未插电。
+供电 `0` 为未插电、`1` 为插电，无法确认时写 `unknown`；取值来自本批冻结快照。
+单侧测试未运行的一侧写 `na`，前台尽力模式 RPS 写 `best`；时间戳用于区分重复实验。
+历史批次按各自保存的配置与快照重命名，分组目录保留；批次内部原始 CSV、日志和快照保持原样，
+其中历史绝对路径可能仍是旧名，可通过 `bench/results/rename-manifest.json` 查询对应的新目录。
+
 每次统一冷却 30 秒；冷却、准备和收尾不计入 `wall_s`。`timeout_s=180` 是异常终止界限，不是负载工作时长。正常运行保持终端安静，结果保存到 `bench/results/<唯一批次>/`。多轮开始前须自行停止外部 scx；监督进程只在开始时询问一次 sudo 密码，此后常驻并持有整批 sleep/idle 阻止锁，批次内不再提权。单次保持用户当前调度器；多轮结束核验 disabled。
 
 | 命令 | 尝试次数 | 正式负载时间约 |
@@ -60,33 +69,18 @@ cd ~/Documents/code/Wisp/Mixbench
 
 每次前后台同时运行，因此不是 60+60 秒。整批实际时间还需加入每次冷却、准备、策略切换和收尾；脚本不增加内部重复或预实验次数。
 
-## 可选逐次唤醒观测
+## 原生全量唤醒统计
 
-排查 wakeup p99 时，在原命令后添加 `--observe-wakeup`：
-
-```sh
-./mixtest 3 -500 --observe-wakeup         # 保持 500 RPS，随机四策略，各三轮
-./mixtest -500 --observe-wakeup          # 只观察当前调度器一次
-```
-
-第一次开启会在冷却和正式测量前，用本地固定提交源码自动构建独立程序 `bench/build/wakeup-observer/schbench-observe`；需要现有源码和 gcc，无需 sudo、无需下载，不替换 Schbench 的正式程序。观测程序、来源摘要和版本标记会进入本批快照，默认命令仍使用原程序。`--case back` 没有前台，不能开启此选项。
-
-运行中每条记录复用原来已有的时钟和延迟值，不增加逐条计时系统调用，不写文件、不打印日志、不分配内存。每个 worker 预先分配并触及固定容量 4096 条记录的内存；14 worker 的事件缓冲合计约 0.875 MiB。各 worker 独占写入自己的缓冲，投递标记使用轻量原子读写。超过容量后仅累计丢失条数，不动态扩容，也不影响原来的原生直方图。
-
-所有原生线程完成后才统一写出，每次的 `run-NNN/<策略>/` 新增：
-
-| 文件 | 用途 |
-|---|---|
-| `front-wakeup.csv` | 每条被保存的原生 wakeup 样本：worker、序号、恢复时间、计时起点、延迟（µs）、停止标志、最近投递位置 |
-| `front-wakeup-running.csv` | 完整观测中仅保留 stopping=0 的样本；供运行阶段 p99 计算与核对 |
-| `front-wakeup.meta.json` | 原生总样本数、已保存和丢失数量、是否完整、各 worker 数量及 CSV 写出耗时 |
-| `front-wakeup-summary.json` | 全部、运行阶段、停止阶段及最近投递标记分别统计的 p99、最大值、超过 100 ms 数量和最慢 20 条 |
-
-先看 `capture_complete`：为 `false` 时保存的是不完整样本，不能据此重建整次 p99。`stopping=1` 表示记录该样本时已置停止标志；`last_post_kind=shutdown/request` 表示最近一次投递代码位置，不是内核跟踪得到的精确唤醒原因。计时起点用“现有恢复时间减原生延迟”还原；固定 RPS 模式可能重复覆盖原生 wake_time，因此这些记录用于定位已有统计的来源，不能当作严格内核 wake-to-run 跟踪。
-
-启用观测时，`summary.csv.wakeup_p99_us` 使用完整观测中 stopping=0 样本的 nearest-rank p99，可能与原生分桶近似百分位略有不同。停止阶段不固定删除 14 条，也不按延迟大小筛选。原始 `front-wakeup.csv`、`front.log` 和原生 JSON 保留全量值；`attempt.json.wakeup_filter` 保存原生 p99、保留/排除数量和规则版本 `running-wakeup-v1`。元数据的 `wakeup_metric` 明确标记口径，未启用观测仍使用原生全量 p99，两种口径不能混作同一组结果排名。
-
-缺失/中断/溢出或没有运行阶段样本时，筛选后的 wakeup_p99_us 留空，并按必需指标缺失标记该次技术无效；不回退到原生全量值，也不改变 RPS 或请求 p99 阈值。CSV 写出发生在原生统计结束后，写出耗时单列；外层 wall_s、CPU/内存统计仍包含这点开销，不宣称观测为零开销。
+所有带前台的 Mixbench 测试（含 nighttest）使用配置中的原版
+`Schbench/bench/build/schbench`，不构建或加载筛选派生程序。
+唤醒样本全部计入原生直方图，包括退出阶段样本；不删除末条或按 `stopping` 筛选。
+`front.log`、`front-native.json` 和 `summary.csv` 使用同一原生统计结果，元数据标记
+`wakeup_metric.scope=native_all`、`revision=native`。不采集逐条或末条观测文件。
+旧 `--observe-wakeup` 参数仅兼容接受，不启用观测或筛选；旧配置中的
+`wakeup_observation` 忽略。若显式指定带观测标记的派生程序则报错，需改回原版路径。
+请求 p99 ≤30 ms 的有效性规则保持。原生退出唤醒可能包含之前空闲等待，因此唤醒 p99
+可能升高；它不是请求 p99，也不因此判定测试无效。
+历史筛选版结果及其记录保持原样，不与当前全量唤醒 p99 混合作同一统计口径比较。
 
 ## 同步与有效性
 
@@ -104,7 +98,7 @@ cd ~/Documents/code/Wisp/Mixbench
 
 计时核验版本 `bounded_approximate_v2` 修正了将 schbench 配置的 60 秒当成原生实测统计时长的问题。固定源码在 `sleep_for_runtime` 内每轮检查结束条件，未结束时执行 `sleep(1)`；配置时长不能直接等同于进程退出时间。新规则把这一个已知轮询周期单独列出，前台预算为 `1.0 + max_native_overhead_s`，当前为 1.5 秒；后台没有这项轮询豁免，仍核对真实 `total time` 和固定时长。
 
-例如前台运行 61.1 秒会留下轮询预算内的警告，运行 61.7 秒仍然无效，不能因为想得到有效结果继续放宽。该预算不能证明多出的时间全部属于收尾，也不能证明前后台的原生统计窗口精确一致；需要严格共同窗口时应另行增加原生边界观测。启动错位、进程重叠不足、超时、退出异常、策略/配置/供电变化继续判无效。计时修正没有改变负载命令、1000 RPS ±2%、60 秒时长和后台 14 线程；当前请求 p99 标准已另行改为 ≤30 ms，并纳入下文的 `valid` 判定。
+例如前台运行 61.1 秒会留下轮询预算内的警告，运行 61.7 秒仍然无效，不能因为想得到有效结果继续放宽。该预算不能证明多出的时间全部属于收尾，也不能证明前后台的原生统计窗口精确一致；需要严格共同窗口时应另行增加原生边界观测。启动错位、进程重叠不足、超时、退出异常、策略/配置/供电变化继续判无效。当时计时修正没有改变负载命令、1000 RPS ±2%、60 秒时长和后台 14 线程；当前后台恢复为 14 线程，当前请求 p99 标准已另行改为 ≤30 ms，并纳入下文的 `valid` 判定。
 
 核验版本、来源和预算保存在 `metadata.json.timing_validation`、`snapshot.json.timing_validation` 及逐次 `attempt.json.synchronization`。前台字段明确标为 `configured_duration_s`，后台为 `native_duration_s`，原生绝对统计起止继续留空；`wall_s` 仍是实测进程窗口。历史计时有效性不回写，前后版本的有效次数不能直接混为同一验收口径。性能是否达标继续单独记录，修正计时后不会自动将超限的前台变为达标。
 
@@ -132,7 +126,7 @@ policy,run,valid,exit_code,wall_s,cpu_time_s,peak_memory_bytes,temp_start_c,temp
 |---|---|
 | `avg_rps` | 前台最终整次平均请求/秒；不使用 RPS p50 |
 | `request_p99_us` | 前台原生最终累计处理阶段请求 p99，µs；不含完整入队等待，不平均多个窗口 p99 |
-| `wakeup_p99_us` | 开启观测：完整 stopping=0 样本的 p99；未开启：原生全量 p99，均为 µs，口径见 metadata.wakeup_metric |
+| `wakeup_p99_us` | 原生全量唤醒直方图 p99，µs，含退出阶段样本；见 metadata.wakeup_metric |
 | `back_events_s` | 后台原生最终 events/s，前台达标后越高越好 |
 | `wall_s` | 首个正式原生 exec 紧前到最后一个退出观测，单调时钟秒；不含协调器准备/收尾 |
 | `cpu_time_s` | 共同父 cgroup 的两侧完整进程树及协调器少量开销累计 CPU 秒 |

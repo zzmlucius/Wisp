@@ -35,6 +35,18 @@ def front_log(runtime=1, rps=1000, request=250):
         f"* 99.0th: {request} (99 samples)\naverage rps: {rps}\n")
 
 
+def tail_metadata(worker_count=2, retained=100, stopping=1):
+    workers=[]
+    for i in range(worker_count):
+        n=retained//worker_count+int(i<retained%worker_count)
+        workers.append({'worker_id':i,'has_sample':True,'last_latency_us':7,
+                        'stopping':stopping,'retained_samples':n,'excluded_samples':stopping})
+    return {'schema_version':2,'revision':observation.FILTER_REVISION,'worker_count':worker_count,
+            'slot_bytes_per_worker':8,'retained_samples':retained,
+            'excluded_samples':worker_count*stopping,'native_wakeup_samples':retained+worker_count*stopping,
+            'workers':workers}
+
+
 class Fixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="mixtest-tests-")
@@ -57,6 +69,9 @@ class Fixture(unittest.TestCase):
             "schedulers": {p: {"command": [sys.executable], "ops": p[4:] + "_test"} for p in POLICIES[1:]}}))
         FakeBatch.fail = FakeBatch.fatal = FakeBatch.cancel = None
         FakeBatch.opens = 0
+        builder=patch.object(observation,"ensure_observer",side_effect=lambda project:
+            (str(self.front),str(self.provenance),{'revision':observation.REVISION},{}))
+        builder.start();self.addCleanup(builder.stop)
 
     def script(self, path, text):
         path.write_text(f"#!{sys.executable}\n" + text)
@@ -68,7 +83,8 @@ class Fixture(unittest.TestCase):
             f"{extra}\ntime.sleep({sleep})\n"
             "runtime=int(sys.argv[sys.argv.index('-r')+1])\n"
             f"print({front_log()!r}.replace('runtime 1 ',f'runtime {{runtime}} '),flush=True)\n"
-            "if '-j' in sys.argv:Path(sys.argv[sys.argv.index('-j')+1]).write_text(json.dumps({'normal':{},'int':{'runtime':runtime,'request_latency_pct99.0':250,'wakeup_latency_pct99.0':7}}))\n")
+            "if '-j' in sys.argv:Path(sys.argv[sys.argv.index('-j')+1]).write_text(json.dumps({'normal':{},'int':{'runtime':runtime,'request_latency_pct99.0':250,'wakeup_latency_pct99.0':7}}))\n"
+            f"if os.getenv('WISP_WAKEUP_TAIL_DIR'):Path(os.environ['WISP_WAKEUP_TAIL_DIR'],'front-wakeup.meta.json').write_text(json.dumps({tail_metadata()!r}))\n")
         write_json(self.provenance, {"commit": configuration.FRONT_COMMIT, "binary_sha256": digest(self.front)})
 
     def write_back(self, extra="", sleep=1):
@@ -90,13 +106,13 @@ class Fixture(unittest.TestCase):
     def rows(self):
         with (self.batch() / "summary.csv").open() as f:return list(csv.DictReader(f))
 
-    def run_fake(self, case="mixed", rounds=None, measured=False, observer=None):
+    def run_fake(self, case="mixed", rounds=None, measured=False, observer=None, **options):
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(cli, "Scheduler", return_value=observer or (RealScheduler() if measured else FakeScheduler())))
             stack.enter_context(patch.object(cli, "BatchScheduler", FakeBatch))
             if not measured:
                 stack.enter_context(patch.object(cli, "measure", self.measured_stub))
-            return cli.experiment(self.cfg(case), rounds=rounds, seed=42)
+            return cli.experiment(self.cfg(case), rounds=rounds, seed=42, **options)
 
     def measured_stub(self, command, directory, environment, log, samples, *args, **kwargs):
         spec = json.loads((directory / 'launch.json').read_text())
@@ -117,9 +133,12 @@ class Fixture(unittest.TestCase):
     def isolated_cli(self):
         original=Path(mixbench_runner.__file__).resolve().parents[1]
         project=self.root/'isolated/Mixbench';project.mkdir(parents=True)
-        for name in ['Compile','Schbench']:(project.parent/name).symlink_to(original.parent/name,target_is_directory=True)
+        for name in ['Compile','Schbench','Collector']:(project.parent/name).symlink_to(original.parent/name,target_is_directory=True)
         shutil.copytree(original/'mixbench_runner',project/'mixbench_runner',ignore=shutil.ignore_patterns('__pycache__'))
         shutil.copyfile(original/'mixtest',project/'mixtest')
+        observer_path=project/'mixbench_runner/observation.py'
+        with observer_path.open('a') as stream:
+            stream.write(f"\ndef ensure_observer(project):\n    return {str(self.front)!r}, {str(self.provenance)!r}, {{'revision': REVISION}}, {{}}\n")
         cfg=json.loads(self.config.read_text());cfg['results_dir']=str(self.root/'records')
         (project/'mixtest.json').write_text(json.dumps(cfg))
         return project/'mixtest'
@@ -180,12 +199,39 @@ class ArgumentTests(Fixture):
         self.assertEqual(error.exception.code, 2)
 
 
+class DirectoryNameTests(unittest.TestCase):
+    def test_config_power_and_unique_identity(self):
+        cfg = {'case': 'mixed', 'front': {'worker_threads': 8}, 'back': {'threads': 10}, 'rps': 500}
+        self.assertEqual(cli.result_directory_name(cfg, {'/sys/class/power_supply/AC/online': '0'}, 'stamp'),
+                         '8-10-500-0_stamp')
+        self.assertEqual(cli.result_directory_name(cfg, {'AC/online': '0', 'USB/online': '1'}, 'stamp2'),
+                         '8-10-500-1_stamp2')
+        self.assertEqual(cli.result_directory_name(cfg, {}, 'stamp'), '8-10-500-unknown_stamp')
+
+    def test_single_side_and_best_effort_labels(self):
+        cfg = {'case': 'front', 'front': {'worker_threads': 14}, 'rps': None}
+        self.assertEqual(cli.result_directory_name(cfg, {}, 'id'), '14-na-best-unknown_id')
+        cfg = {'case': 'back', 'back': {'threads': 8}}
+        self.assertEqual(cli.result_directory_name(cfg, {}, 'id'), 'na-8-na-unknown_id')
+
+
 class ConfigurationTests(Fixture):
-    def test_observation_back_rejected_and_saved_flag_not_silently_enabled(self):
-        with self.assertRaisesRegex(ValueError, "需要前台"):
-            self.cfg("back", observe_wakeup=True)
+    def test_filter_disabled_even_with_legacy_flag_or_saved_settings(self):
         self.change(wakeup_observation={"enabled": True})
-        self.assertNotIn("wakeup_observation", self.cfg())
+        with patch.object(observation, 'ensure_observer', side_effect=AssertionError('filter must not build')):
+            for case in ('mixed', 'front', 'back'):
+                cfg = self.cfg(case, observe_wakeup=True)
+                self.assertNotIn('wakeup_observation', cfg)
+                if case != 'back':
+                    self.assertEqual(cfg['front']['program'], str(self.front))
+                    self.assertEqual(cfg['_program_sha256']['front'], digest(self.front))
+
+    def test_instrumented_binary_cannot_be_mistaken_for_native(self):
+        provenance = json.loads(self.provenance.read_text())
+        provenance['observation'] = {'revision': 'last-wakeup-slots-v1'}
+        write_json(self.provenance, provenance)
+        with self.assertRaisesRegex(ValueError, '原生全量统计'):
+            self.cfg()
 
     def test_shipped_scenario_generates_requested_native_workloads(self):
         project = Path(mixbench_runner.__file__).resolve().parents[1]
@@ -403,51 +449,28 @@ class ResultTests(Fixture):
 
 
 class RunTests(Fixture):
-    def test_complete_observation_updates_csv_attempt_and_analysis_consistently(self):
-        cfg=self.cfg();cfg['wakeup_observation']={'enabled':True}
-        observed={'status':'complete','capture_complete':True,
-                  'groups':{'running':{'count':98,'p99_us':2},'stopping':{'count':2,'p99_us':7}}}
-        with patch.object(self,'cfg',return_value=cfg), patch.object(cli,'summarize_trace',return_value=observed):
-            self.assertEqual(self.run_fake(rounds=1),0)
-        self.assertTrue(all(row['wakeup_p99_us']=='2' and row['valid']=='True' for row in self.rows()))
-        metadata=json.loads((self.batch()/'metadata.json').read_text())
-        self.assertEqual(metadata['wakeup_metric']['scope'],'running_only')
-        for policy,data in metadata['analysis']['policies'].items():
-            self.assertEqual(data['metrics_valid']['wakeup_p99_us']['median'],2)
+    def test_native_all_metric_needs_no_filter_sidecar(self):
+        self.assertEqual(self.run_fake(rounds=1), 0)
+        self.assertTrue(all(row['wakeup_p99_us'] == '7.0' and row['valid'] == 'True' for row in self.rows()))
+        metadata = json.loads((self.batch()/'metadata.json').read_text())
+        self.assertEqual(metadata['wakeup_metric']['scope'], 'native_all')
         for path in self.batch().glob('run-*/*/attempt.json'):
-            detail=json.loads(path.read_text())
-            self.assertEqual(detail['result']['wakeup_p99_us'],2)
-            self.assertEqual(detail['wakeup_filter']['native_wakeup_p99_us'],7)
-
-    def test_missing_observation_leaves_filtered_metric_empty_and_still_cleans_scheduler(self):
-        cfg = self.cfg();cfg["wakeup_observation"] = {"enabled": True}
-        with patch.object(self, "cfg", return_value=cfg):
-            self.assertEqual(self.run_fake(rounds=1), 1)
-        self.assertTrue(all(row["valid"] == "False" and row["wakeup_p99_us"] == "" for row in self.rows()))
-        for path in self.batch().glob("run-*/*/attempt.json"):
             detail = json.loads(path.read_text())
-            self.assertEqual(detail["wakeup_observation"]["status"], "unavailable")
-            self.assertEqual(detail["wakeup_filter"]["native_wakeup_p99_us"], 7)
-        self.assertEqual(json.loads((self.batch()/"metadata.json").read_text())["final_scheduler"]["state"], "disabled")
+            self.assertNotIn('wakeup_filter', detail)
+            self.assertFalse((path.parent/'front-wakeup.meta.json').exists())
+            self.assertNotIn('front_environment', json.loads((path.parent/'launch.json').read_text()))
 
-    def test_observation_write_error_does_not_block_scheduler_cleanup(self):
-        cfg = self.cfg();cfg["wakeup_observation"] = {"enabled": True}
-        with patch.object(self, "cfg", return_value=cfg), \
-             patch.object(cli, "summarize_trace", side_effect=OSError("disk unavailable")):
-            self.assertEqual(self.run_fake(rounds=1), 1)
-        self.assertEqual(json.loads((self.batch()/"metadata.json").read_text())["final_scheduler"]["state"], "disabled")
-
-    def test_observation_environment_is_front_only_and_stale_values_removed(self):
-        front_marker, back_marker = self.root/"front-env", self.root/"back-env"
-        self.write_front(extra=f"Path({str(front_marker)!r}).write_text(os.environ.get('WISP_WAKEUP_TRACE_DIR','absent'))")
-        self.write_back(extra=f"Path({str(back_marker)!r}).write_text(os.environ.get('WISP_WAKEUP_TRACE_DIR','absent'))")
-        cfg=self.cfg();cfg["wakeup_observation"]={"enabled":True}
-        with patch.dict(os.environ, {"WISP_WAKEUP_TRACE_DIR":"stale", "WISP_WAKEUP_CAPACITY":"1"}):
-            self.assertEqual(cli.experiment(cfg),1)
-        attempt=next(self.batch().glob("run-*/*"))
-        self.assertEqual(front_marker.read_text(),str(attempt))
-        self.assertEqual(back_marker.read_text(),"absent")
-        self.assertEqual(json.loads((attempt/"launch.json").read_text())["front_environment"]["WISP_WAKEUP_CAPACITY"],"4096")
+    def test_native_children_receive_no_observation_environment(self):
+        front_marker,back_marker=self.root/'front-env',self.root/'back-env'
+        self.write_front(extra=f"Path({str(front_marker)!r}).write_text(os.environ.get('WISP_WAKEUP_TAIL_DIR','absent')+'|'+os.environ.get('WISP_WAKEUP_TRACE_DIR','absent'))")
+        self.write_back(extra=f"Path({str(back_marker)!r}).write_text(os.environ.get('WISP_WAKEUP_TAIL_DIR','absent')+'|'+os.environ.get('WISP_WAKEUP_TRACE_DIR','absent'))")
+        with patch.dict(os.environ,{'WISP_WAKEUP_TRACE_DIR':'stale','WISP_WAKEUP_CAPACITY':'4096','WISP_WAKEUP_TAIL_DIR':'stale'}):
+            self.assertEqual(cli.experiment(self.cfg()),0)
+        attempt=next(self.batch().glob('run-*/*'))
+        self.assertEqual(front_marker.read_text(),'absent|absent')
+        self.assertEqual(back_marker.read_text(),'absent|absent')
+        self.assertNotIn('front_environment',json.loads((attempt/'launch.json').read_text()))
+        self.assertFalse((attempt/'front-wakeup.meta.json').exists())
 
     def test_single_silent_schema_and_current_policy_preserved(self):
         observer=FakeScheduler();before=observer.snapshot();out=io.StringIO()
@@ -495,6 +518,17 @@ class RunTests(Fixture):
         self.assertTrue(all(set(order)==set(POLICIES) for order in m['orders']))
         self.assertEqual(m['final_scheduler']['state'],'disabled')
 
+    def test_round_progress_reports_completed_and_persisted_rounds(self):
+        self.change(latency_limit_us=100)
+        progress = []
+
+        def report(round_number, rounds):
+            metadata = json.loads((self.batch() / "metadata.json").read_text())
+            progress.append((round_number, rounds, len(self.rows()), len(metadata["attempts"])))
+
+        self.assertEqual(self.run_fake(rounds=3, on_round_complete=report), 1)
+        self.assertEqual(progress, [(1, 3, 4, 4), (2, 3, 8, 8), (3, 3, 12, 12)])
+
     def test_single_cases_leave_inapplicable_columns_empty(self):
         for case,empty in [('front','back_events_s'),('back','avg_rps')]:
             with self.subTest(case=case):
@@ -530,6 +564,20 @@ class RunTests(Fixture):
         sync=detail['synchronization'];self.assertGreater(sync['process_overlap_ratio'],0.99)
         self.assertEqual(set(detail['execution']['children']),{'front','back'})
         self.assertTrue(all(c['affinity']==sorted(os.sched_getaffinity(0)) and c['nice']==0 for c in detail['execution']['children'].values()))
+        attempt = self.batch() / "run-001/default"
+        meta = json.loads((attempt / "workload-meta.json").read_text())
+        with (attempt / "workload.csv").open() as stream:
+            reader = csv.DictReader(stream)
+            names = [column["name"] for column in meta["columns"]]
+            self.assertEqual(reader.fieldnames, ["timestamp_monotonic_ns", "dt_s", *names])
+            self.assertEqual(len(names), 19)
+            rows = list(reader)
+        self.assertEqual(rows[0]["cpu_usage_mean"], "")
+        self.assertNotEqual(rows[0]["mem_available_kib"], "")
+        self.assertTrue(meta["training_sample_rows_1based"])
+        self.assertGreater(min(meta["training_sample_rows_1based"]), 2)
+        self.assertEqual(meta["probes"]["scheduler"], "not_configured")
+
 
     def test_one_side_failure_stops_other_promptly(self):
         marker=self.root/'back.pid'
@@ -581,122 +629,92 @@ class RunTests(Fixture):
 
 
 class ObservationTests(Fixture):
-    def write_trace(self, dropped=0):
-        attempt=self.root/'trace';attempt.mkdir()
-        rows=[{'worker_id':0,'sequence':1,'resume_realtime_us':1000100,'origin_realtime_us':1000000,
-               'latency_us':100,'stopping':0,'last_post_kind':'request'},
-              {'worker_id':0,'sequence':2,'resume_realtime_us':2000000,'origin_realtime_us':1150000,
-               'latency_us':850000,'stopping':1,'last_post_kind':'shutdown'}]
-        with (attempt/'front-wakeup.csv').open('w',newline='') as stream:
-            writer=csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
-        write_json(attempt/'front-wakeup.meta.json',{'schema_version':1,'capture_complete':not dropped,
-            'recorded_samples':2,'native_wakeup_samples':2+dropped,'dropped_samples':dropped})
-        return attempt
-
-    def test_summary_keeps_running_and_stopping_samples_separate(self):
-        attempt=self.write_trace();original=(attempt/'front-wakeup.csv').read_bytes()
+    def test_last_normal_sample_is_kept(self):
+        attempt=self.root/'audit';attempt.mkdir()
+        write_json(attempt/'front-wakeup.meta.json',tail_metadata(stopping=0))
+        (attempt/'front.log').write_text(front_log())
         summary=observation.summarize_trace(attempt)
-        self.assertEqual(summary['status'],'complete')
-        self.assertEqual(summary['groups']['all']['p99_us'],850000)
-        self.assertEqual(summary['groups']['running']['p99_us'],100)
-        self.assertEqual(summary['groups']['stopping']['count'],1)
-        self.assertEqual(summary['by_last_post']['shutdown']['over_100ms'],1)
-        self.assertEqual(summary['slowest'][0]['last_post_kind'],'shutdown')
-        self.assertEqual((attempt/'front-wakeup.csv').read_bytes(),original)
-        with (attempt/'front-wakeup-running.csv').open() as stream:filtered=list(csv.DictReader(stream))
-        self.assertEqual(len(filtered),1);self.assertEqual(filtered[0]['stopping'],'0')
-        row={'wakeup_p99_us':850000,'avg_rps':1000,'request_p99_us':250,'valid':True};details={}
+        self.assertEqual(summary['excluded_samples'],0)
+        row={'wakeup_p99_us':7};details={}
         self.assertIsNone(observation.apply_running_wakeup(row,details,summary))
-        self.assertEqual(row['wakeup_p99_us'],100)
-        self.assertEqual(row['avg_rps'],1000);self.assertEqual(row['request_p99_us'],250)
-        self.assertTrue(row['valid'])
-        self.assertEqual(details['wakeup_filter']['native_wakeup_p99_us'],850000)
-        self.assertEqual(details['wakeup_filter']['excluded_samples'],1)
+        self.assertEqual(row['wakeup_p99_us'],7)
+        self.assertFalse((attempt/'front-wakeup.csv').exists())
 
-    def test_no_stopping_samples_means_nothing_is_discarded(self):
-        attempt=self.write_trace()
-        text=(attempt/'front-wakeup.csv').read_text().replace('850000,1,shutdown','850000,0,request')
-        (attempt/'front-wakeup.csv').write_text(text)
-        summary=observation.summarize_trace(attempt)
-        row={'wakeup_p99_us':850000};details={}
-        self.assertIsNone(observation.apply_running_wakeup(row,details,summary))
-        self.assertEqual(row['wakeup_p99_us'],850000)
-        self.assertEqual(details['wakeup_filter']['excluded_samples'],0)
+    def test_inconsistent_slots_or_histogram_count_are_rejected(self):
+        attempt=self.root/'audit';attempt.mkdir();(attempt/'front.log').write_text(front_log())
+        for kind in ('count','normal_removed','wrong_workers','histogram'):
+            data=tail_metadata()
+            if kind=='count':data['excluded_samples']+=1
+            if kind=='normal_removed':data['workers'][0]['stopping']=0
+            if kind=='wrong_workers':data['workers'][0]['worker_id']=1
+            if kind=='histogram':data['retained_samples']+=1;data['native_wakeup_samples']+=1;data['workers'][0]['retained_samples']+=1
+            write_json(attempt/'front-wakeup.meta.json',data)
+            with self.subTest(kind=kind),self.assertRaises(ValueError):observation.summarize_trace(attempt)
 
-    def test_no_running_samples_leaves_metric_empty(self):
-        attempt=self.write_trace()
-        text=(attempt/'front-wakeup.csv').read_text().replace('100,0,request','100,1,shutdown')
-        (attempt/'front-wakeup.csv').write_text(text)
-        summary=observation.summarize_trace(attempt)
-        row={'wakeup_p99_us':850000};details={}
-        self.assertIn('没有 stopping=0',observation.apply_running_wakeup(row,details,summary))
-        self.assertIsNone(row['wakeup_p99_us'])
-
-    def test_overflow_does_not_claim_complete_percentiles(self):
-        summary=observation.summarize_trace(self.write_trace(dropped=1))
-        self.assertEqual(summary['status'],'incomplete')
-        self.assertFalse(summary['capture_complete'])
-        self.assertEqual(summary['capture']['dropped_samples'],1)
-        row={'wakeup_p99_us':850000};details={}
-        self.assertIn('不完整',observation.apply_running_wakeup(row,details,summary))
-        self.assertIsNone(row['wakeup_p99_us'])
-        self.assertEqual(details['wakeup_filter']['native_wakeup_p99_us'],850000)
-
-    def test_missing_or_corrupted_trace_is_explicit(self):
-        attempt=self.root/'missing';attempt.mkdir()
-        self.assertEqual(observation.summarize_trace(attempt)['status'],'unavailable')
-        attempt=self.write_trace()
-        text=(attempt/'front-wakeup.csv').read_text().replace('850000','850001')
-        (attempt/'front-wakeup.csv').write_text(text)
-        self.assertEqual(observation.summarize_trace(attempt)['status'],'unavailable')
+    def test_missing_or_zero_retained_samples_never_fall_back(self):
+        for summary in ({'status':'unavailable'}, {'status':'complete','worker_count':2,'retained_samples':0}):
+            row={'wakeup_p99_us':850000};details={}
+            self.assertIsNotNone(observation.apply_running_wakeup(row,details,summary))
+            self.assertIsNone(row['wakeup_p99_us'])
 
 
-@unittest.skipUnless(shutil.which('gcc'), 'native observation verification requires gcc')
+@unittest.skipUnless(shutil.which('gcc'),'native last-slot verification requires gcc')
 class NativeObservationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temp=tempfile.TemporaryDirectory(prefix='wakeup-native-tests-')
-        cls.addClassCleanup(cls.temp.cleanup)
-        cls.root=Path(cls.temp.name)
-        project=Path(mixbench_runner.__file__).resolve().parents[1]
-        cls.project=cls.root/'Mixbench'
-        (cls.project/'native').mkdir(parents=True)
+        cls.temp=tempfile.TemporaryDirectory(prefix='wakeup-last-native-');cls.addClassCleanup(cls.temp.cleanup)
+        cls.root=Path(cls.temp.name);project=Path(mixbench_runner.__file__).resolve().parents[1]
+        cls.project=cls.root/'Mixbench';(cls.project/'native').mkdir(parents=True)
         shutil.copy2(project/'native/wakeup_observer.h',cls.project/'native/wakeup_observer.h')
         (cls.root/'Schbench').symlink_to(project.parent/'Schbench',target_is_directory=True)
-        source=cls.root/'Schbench/bench/src'/('schbench-'+observation.COMMIT)/'schbench.c'
-        if not source.exists():raise unittest.SkipTest('pinned native source is unavailable')
         cls.binary,cls.provenance,cls.identity,_=observation.ensure_observer(cls.project)
 
-    def run_native(self, capacity):
-        attempt=self.root/('run-'+str(capacity));attempt.mkdir()
-        environment=os.environ.copy();environment.update(WISP_WAKEUP_TRACE_DIR=str(attempt),WISP_WAKEUP_CAPACITY=str(capacity))
+    def test_native_four_workers_emit_only_four_last_slots(self):
+        attempt=self.root/'native';attempt.mkdir()
+        environment=os.environ.copy();environment['WISP_WAKEUP_TAIL_DIR']=str(attempt)
         command=[self.binary,'-m','2','-t','2','-r','2','-F','16','-n','1','-s','100',
                  '-R','100','-w','0','-z','0','-i','3','-j',str(attempt/'front-native.json')]
         with (attempt/'front.log').open('w') as log:
-            process=subprocess.run(command,env=environment,stdout=log,stderr=subprocess.STDOUT,timeout=10)
-        self.assertEqual(process.returncode,0,(attempt/'front.log').read_text())
+            result=subprocess.run(command,env=environment,stdout=log,stderr=subprocess.STDOUT,timeout=10)
+        self.assertEqual(result.returncode,0,(attempt/'front.log').read_text())
         metrics,_=results.parse_front(attempt/'front.log',attempt/'front-native.json',2)
         self.assertGreater(metrics['avg_rps'],0)
-        return attempt,observation.summarize_trace(attempt)
-
-    def test_native_events_match_original_count_and_have_shutdown_markers(self):
-        attempt,summary=self.run_native(4096)
-        self.assertEqual(summary['status'],'complete')
-        self.assertEqual(summary['capture']['allocated_event_bytes'],4*4096*16)
-        self.assertGreater(summary['groups']['running']['count'],0)
-        self.assertGreater(summary['groups']['stopping']['count'],0)
-        self.assertGreater(summary['by_last_post']['shutdown']['count'],0)
-        self.assertEqual(summary['groups']['all']['count'],summary['capture']['native_wakeup_samples'])
-        with (attempt/'front-wakeup.csv').open() as stream:rows=list(csv.DictReader(stream))
-        self.assertEqual({int(row['worker_id']) for row in rows},{0,1,2,3})
+        summary=observation.summarize_trace(attempt)
+        self.assertEqual(summary['worker_count'],4);self.assertEqual(len(summary['workers']),4)
+        self.assertGreater(summary['retained_samples'],0)
+        self.assertLessEqual(summary['excluded_samples'],4)
+        self.assertEqual(summary['native_wakeup_samples'],summary['retained_samples']+summary['excluded_samples'])
+        self.assertFalse((attempt/'front-wakeup.csv').exists())
         self.assertEqual(observation.ensure_observer(self.project)[2],self.identity)
 
-    def test_native_capacity_exhaustion_keeps_original_histogram(self):
-        _,summary=self.run_native(1)
-        self.assertEqual(summary['status'],'incomplete')
-        self.assertGreater(summary['capture']['dropped_samples'],0)
-        self.assertEqual(summary['capture']['recorded_samples']+summary['capture']['dropped_samples'],
-                         summary['capture']['native_wakeup_samples'])
+    def test_native_histogram_keeps_normal_tail_and_discards_only_stopping_tail(self):
+        source=(self.project/'bench/build/wakeup-last/schbench-last.c').read_text()
+        source=source.replace('int main(int ac, char **av)','int schbench_original_main(int ac, char **av)')
+        self.assertIn('int schbench_original_main',source)
+        source += r"""
+int main(void) {
+    struct thread_data td = {0};
+    wisp_record_last_wakeup(&td, 10, 0);
+    wisp_record_last_wakeup(&td, 900000, 1);
+    wisp_finish_last_wakeup(&td);
+    if (td.wakeup_stats.nr_samples != 1 || td.wakeup_stats.max != 10) return 1;
+    memset(&td, 0, sizeof(td));
+    wisp_record_last_wakeup(&td, 10, 0);
+    wisp_record_last_wakeup(&td, 900000, 0);
+    wisp_finish_last_wakeup(&td);
+    if (td.wakeup_stats.nr_samples != 2 || td.wakeup_stats.max != 900000) return 2;
+    memset(&td, 0, sizeof(td));
+    wisp_record_last_wakeup(&td, 800000, 1);
+    wisp_record_last_wakeup(&td, 900000, 1);
+    wisp_finish_last_wakeup(&td);
+    if (td.wakeup_stats.nr_samples != 1 || td.wakeup_stats.max != 800000) return 3;
+    return 0;
+}
+"""
+        path=self.root/'histogram.c';path.write_text(source);binary=self.root/'histogram'
+        result=subprocess.run(['gcc','-O2','-D_GNU_SOURCE','-I',str(self.project/'native'),str(path),'-o',str(binary),'-lpthread','-lm'],capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(subprocess.run([str(binary)]).returncode,0)
 
 
 class CleanupTests(Fixture):

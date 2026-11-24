@@ -38,8 +38,11 @@ def executable(value, base, label):
 def protected_paths(cfg, config_path):
     project = Path(cfg["_project"])
     paths = [project / "mixbench_runner", project / "native", project / "tests", project / "bench/src", project / "bench/build"]
-    paths += [project.parent / name for name in ("Compile", "Schbench", "Hackbench")]
+    paths += [project.parent / name for name in ("Compile", "Schbench", "Hackbench", "Collector")]
     paths += [Path(cfg[side]["program"]) for side in ("front", "back") if Path(cfg[side]["program"]).is_absolute()]
+    probe = cfg.get("collector", {}).get("bpf_object")
+    if probe:
+        paths.append(Path(probe))
     root = Path(cfg["results_dir"])
     if any(root.is_relative_to(p.resolve()) or p.resolve().is_relative_to(root) for p in paths):
         raise ConfigError("结果目录与代码、程序、其他测试或基线重叠")
@@ -58,9 +61,7 @@ def load_config(path, case="mixed", rps=None, bg_threads=None, output=None, obse
         raise ConfigError("mixtest.json 顶层必须为对象")
     if case not in {"mixed", "front", "back"}:
         raise ConfigError("case 必须为 mixed/front/back")
-    if observe_wakeup and case == "back":
-        raise ConfigError("--observe-wakeup 需要前台；不能用于 --case back")
-    # Observation is explicitly enabled by the CLI, never inherited silently from a saved config.
+    # The old CLI flag is compatibility-only; saved filtering settings are ignored.
     cfg.pop("wakeup_observation", None)
     cfg.update(case=case, _project=str(PROJECT))
     cfg["cpus"] = cpuset(cfg["cpus"])
@@ -133,15 +134,6 @@ def load_config(path, case="mixed", rps=None, bg_threads=None, output=None, obse
         if "/" in value:
             cfg[side]["program"] = str((path.parent / Path(value).expanduser()).resolve())
     front["provenance"] = str((path.parent / Path(front["provenance"]).expanduser()).resolve())
-    if observe_wakeup:
-        from .observation import CAPACITY, FILTER_REVISION, ensure_observer
-        program, provenance, identity, files = ensure_observer(PROJECT)
-        front.update(program=program, provenance=provenance)
-        cfg["_program_sha256"]["front"] = digest(program)
-        cfg["_observation_files"] = files
-        cfg["wakeup_observation"] = {"enabled": True, "capacity_per_worker": CAPACITY,
-            **identity, "filter_revision": FILTER_REVISION, "filter_rule": "stopping == 0",
-            "note": "汇总 wakeup_p99_us 仅统计运行阶段；原生全量值和原始样本另行保留"}
     if case != "back":
         front_cfg = {"program": front["program"], "provenance": front["provenance"], "cpus": cfg["cpus"],
             "workload": {key: value for key, value in front.items() if key not in {"program", "provenance"}},
@@ -155,6 +147,8 @@ def load_config(path, case="mixed", rps=None, bg_threads=None, output=None, obse
             cfg["_front"] = load_front(check, fixed=cfg["front_mode"] == "fixed_rps")
         if cfg["_front"].get("_provenance", {}).get("commit") != FRONT_COMMIT:
             raise ConfigError("schbench 计时口径未核对：首版需要现有 Schbench/build-schbench 的固定提交")
+        if cfg["_front"].get("_provenance", {}).get("observation"):
+            raise ConfigError("当前使用原生全量统计，请将 front.program/provenance 指向原版 Schbench/bench/build 程序")
         cfg["_versions"]["front"] = {"help": cfg["_front"]["_native_help"], "provenance": cfg["_front"]["_provenance"]}
     if case != "front":
         infos = {"version": command_output([back["program"], "--version"]),
@@ -177,6 +171,21 @@ def load_config(path, case="mixed", rps=None, bg_threads=None, output=None, obse
     for key in ("temperature_sensor", "cgroup_parent"):
         if cfg.setdefault(key, None):
             cfg[key] = str((path.parent / Path(cfg[key]).expanduser()).resolve())
+    collector = cfg.setdefault("collector", {})
+    if not isinstance(collector, dict) or set(collector) - {"device", "bpf_object", "runqueue_verified"}:
+        raise ConfigError("collector 仅支持 device、bpf_object 和 runqueue_verified")
+    device = collector.get("device")
+    if device is not None and (not isinstance(device, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", device)
+                               or device in {".", ".."}):
+        raise ConfigError("collector.device 必须为 /sys/block 下的设备名")
+    probe = collector.get("bpf_object")
+    if probe is not None:
+        if not isinstance(probe, str) or not probe:
+            raise ConfigError("collector.bpf_object 必须为文件路径")
+        collector["bpf_object"] = str((path.parent / Path(probe).expanduser()).resolve())
+    rq_verified = collector.get("runqueue_verified", False)
+    if type(rq_verified) is not bool or (rq_verified and not probe):
+        raise ConfigError("collector.runqueue_verified 必须为布尔值，启用时须提供探针对象")
     cfg.update(_config_path=str(path), _config_sha256=hashlib.sha256(raw).hexdigest())
     protected_paths(cfg, path)
     return cfg

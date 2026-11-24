@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Four fixed 14/14 mixed batches with whole-queue desktop inhibition."""
+import argparse
+import contextlib
+from datetime import datetime, timezone
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parent
+for package in ('Compile', 'Schbench', 'Mixbench'):
+    sys.path.insert(0, str(ROOT / package))
+loader = importlib.machinery.SourceFileLoader('midnight_shared_night', str(ROOT / 'nighttest'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+night = importlib.util.module_from_spec(spec)
+loader.exec_module(night)
+
+from compilebench_runner.cli import acquire_lock, scheduler_specs
+from compilebench_runner.control import BatchScheduler, POLICIES
+from compilebench_runner.interrupts import Interrupts
+from compilebench_runner.metrics import BuildCgroup
+from compilebench_runner.policy import Scheduler
+from compilebench_runner.system import digest, machine_info, power_error, power_state, sensor_path, temperature
+from mixbench_runner import cli as mixed
+from mixbench_runner.configuration import load_config, commands
+from schbench_runner.cli import effective
+
+RPS_VALUES = (500, 1000, 1500, 2000)
+COOLDOWN_S = 60
+BATCH_REST_S = 120
+MIN_FREE_BYTES = 1024**3
+
+
+class DesktopGuard:
+    """Own GNOME idle/suspend cookie and logind inhibitor FD in this process."""
+    def __init__(self, label='midnighttest'):
+        self.label = label
+        self.session = None
+        self.cookie = None
+        self.fd = None
+        self.info = {'status': 'not_acquired', 'gnome_flags': 12, 'logind_what': 'sleep:idle',
+                     'scope': 'entire queue, including cooldown and authentication'}
+
+    def call(self, method, parameters, reply):
+        return self.session.call_sync('org.gnome.SessionManager', '/org/gnome/SessionManager',
+            'org.gnome.SessionManager', method, parameters, self.GLib.VariantType.new(reply),
+            self.Gio.DBusCallFlags.NONE, 5000, None)
+
+    def __enter__(self):
+        try:
+            import gi
+            gi.require_version('Gio', '2.0')
+            from gi.repository import Gio, GLib
+            self.Gio, self.GLib = Gio, GLib
+            self.session = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            self.cookie, = self.call('Inhibit', GLib.Variant('(susu)',
+                (self.label, 0, 'Wisp mixed benchmark queue', 12)), '(u)').unpack()
+            system = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            reply, descriptors = system.call_with_unix_fd_list_sync('org.freedesktop.login1',
+                '/org/freedesktop/login1', 'org.freedesktop.login1.Manager', 'Inhibit',
+                GLib.Variant('(ssss)', ('sleep:idle', self.label, 'Wisp mixed benchmark queue', 'block')),
+                GLib.VariantType.new('(h)'), Gio.DBusCallFlags.NONE, 5000, None, None)
+            index, = reply.unpack()
+            self.fd = descriptors.get(index)
+            self.info['status'] = 'held'
+            self.check()
+            return self
+        except BaseException:
+            self.close()
+            raise
+
+    def check(self):
+        if self.fd is None or self.cookie is None:
+            raise RuntimeError('整批防熄屏/休眠锁未持有')
+        os.fstat(self.fd)
+        for flag in (4, 8):
+            active, = self.call('IsInhibited', self.GLib.Variant('(u)', (flag,)), '(b)').unpack()
+            if not active:
+                raise RuntimeError('GNOME 防熄屏/休眠锁失效')
+
+    def close(self):
+        try:
+            if self.cookie is not None:
+                self.call('Uninhibit', self.GLib.Variant('(u)', (self.cookie,)), '()')
+        finally:
+            self.cookie = None
+            if self.fd is not None:
+                os.close(self.fd)
+                self.fd = None
+            self.info['status'] = 'released'
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def prepare_jobs(directory, power):
+    base = load_config(ROOT / 'Mixbench/mixtest.json')
+    settings = effective(base)
+    settings['front']['worker_threads'] = 14
+    settings['back']['threads'] = 14
+    settings['runtime_s'] = 60
+    settings['cooldown_s'] = max(COOLDOWN_S, settings['cooldown_s'])
+    settings['schedulers'] = scheduler_specs(base)
+    settings['results_dir'] = str(directory / 'results')
+    inputs = directory / 'inputs'
+    inputs.mkdir()
+    (directory / 'logs').mkdir()
+    jobs = []
+    for rps in RPS_VALUES:
+        settings['rps'] = rps
+        name = mixed.result_directory_name(settings, power, '').rstrip('_')
+        path = inputs / (name + '.json')
+        night.write_status(path, settings)
+        cfg = load_config(path)
+        scheduler_specs(cfg)
+        jobs.append({'name': name, 'command': ['./Mixbench/mixtest', '3', f'-{rps}',
+                     '--bg-threads', '14', '--output', str(directory / 'results')],
+                     'config_file': str(path), 'config': cfg})
+    return jobs
+
+
+def preflight(jobs, directory, *, label='midnighttest', batch_rest_s=BATCH_REST_S, extra_files=()):
+    if not shutil.which('sudo') or not shutil.which('systemd-inhibit'):
+        raise RuntimeError('需要 sudo 和 systemd-inhibit')
+    initial = Scheduler().initial()
+    if initial['state'] != 'disabled':
+        raise RuntimeError(f'请先停止外部 scx 调度器，再运行 {label}')
+    Scheduler().verify(initial, os.getpid())
+    attempts_per_batch = 3 * len(POLICIES)
+    workload_seconds = sum(j['config']['runtime_s'] + j['config']['cooldown_s'] for j in jobs)
+    report = {'status': 'checking', 'queue': label, 'machine': machine_info(), 'native_commands': {},
+              'rounds_per_scheduler': 3, 'batch_count': len(jobs), 'attempt_count': len(jobs) * attempts_per_batch,
+              'cooldown_s': jobs[0]['config']['cooldown_s'], 'batch_rest_s': batch_rest_s,
+              'minimum_time_s': attempts_per_batch * workload_seconds + (len(jobs) - 1) * batch_rest_s,
+              'frozen_files': {}}
+    frozen = report['frozen_files']
+    for program in (ROOT / 'midnighttest', ROOT / 'nighttest', *extra_files):
+        frozen[str(program)] = digest(program)
+    for package in ('Compile/compilebench_runner', 'Schbench/schbench_runner', 'Mixbench/mixbench_runner'):
+        for file in (ROOT / package).glob('*.py'):
+            frozen[str(file)] = digest(file)
+    for job in jobs:
+        cfg = job['config']
+        report['native_commands'][job['name']] = commands(cfg, directory / 'results/BATCH/run-NNN/POLICY')
+        frozen[cfg['_config_path']] = cfg['_config_sha256']
+        for side in ('front', 'back'):
+            frozen[cfg[side]['program']] = cfg['_program_sha256'][side]
+        frozen[cfg['front']['provenance']] = digest(cfg['front']['provenance'])
+        for item in scheduler_specs(cfg).values():
+            frozen[item['command'][0]] = digest(item['command'][0])
+    report['free_bytes'] = shutil.disk_usage(directory).free
+    if report['free_bytes'] < MIN_FREE_BYTES:
+        raise RuntimeError('结果盘可用空间不足 1 GiB')
+    sensor = sensor_path(jobs[0]['config']['temperature_sensor'])
+    value = temperature(sensor)
+    if sensor is None or value is None:
+        raise RuntimeError('无法读取 CPU 温度传感器，不能核验本批冷却条件')
+    report['sensor'] = str(sensor)
+    report['temperature_c'] = value
+    group = BuildCgroup(jobs[0]['config']['cgroup_parent'])
+    try:
+        if group.path is None:
+            raise RuntimeError(group.reason)
+        child = group.path / 'midnight-preflight-child'
+        child.mkdir()
+        try:
+            if not os.access(child / 'cgroup.procs', os.W_OK):
+                raise RuntimeError('子 cgroup 不可写')
+        finally:
+            child.rmdir()
+        report['cgroup'] = {'status': 'available', 'notes': group.notes}
+    finally:
+        group.close()
+    report['status'] = 'ready'
+    night.write_status(directory / 'preflight.json', report)
+    return report
+
+
+def verify_queue(report, directory, guard):
+    guard.check()
+    for name, expected in report['frozen_files'].items():
+        if digest(name) != expected:
+            raise RuntimeError('本队列冻结输入发生变化: ' + name)
+    if sorted(os.sched_getaffinity(0)) != report['machine']['available_cpus']:
+        raise RuntimeError('队列进程可用 CPU 范围变化')
+    issue = power_error(report['machine']['power'], power_state(), report.get('queue', 'midnighttest') + ' 队列')
+    if issue:
+        raise RuntimeError(issue)
+    if shutil.disk_usage(directory).free < MIN_FREE_BYTES:
+        raise RuntimeError('结果盘可用空间不足 1 GiB')
+
+
+def scheduler_preflight(cfg, directory, interrupts):
+    directory.mkdir()
+    controller = BatchScheduler(scheduler_specs(cfg), directory, interrupts,
+        timeout=cfg['scheduler_timeout_s'], settle=cfg['scheduler_settle_s'], workload_name='mixtest')
+    selected = []
+    try:
+        controller.open()
+        for policy in POLICIES[1:]:
+            controller.select(policy, directory / (policy + '.log'))
+            selected.append(policy)
+            issue = controller.stop()
+            if issue:
+                raise RuntimeError(issue)
+    finally:
+        controller.close()
+        night.write_status(directory / 'status.json', {'selected': selected, 'controller': controller.info})
+
+
+def run_queue(jobs, directory, authorization, guard, report, interrupts, *, round_progress=False):
+    batch_rest_s = report.get('batch_rest_s', BATCH_REST_S)
+    status = {'status': 'running', 'started_utc': night.stamp(), 'inhibition': guard.info,
+              'jobs': [{'name': j['name'], 'command': j['command'], 'config_file': j['config_file'],
+                        'status': 'pending'} for j in jobs]}
+    path = directory / 'status.json'
+    night.write_status(path, status)
+    terminal = None
+    try:
+        if round_progress:
+            terminal = os.dup(1)
+        for index, (job, record) in enumerate(zip(jobs, status['jobs'])):
+            if index:
+                status['phase'] = 'batch_cooldown'
+                status['batch_rest_s'] = batch_rest_s
+                night.write_status(path, status)
+                deadline = time.monotonic() + batch_rest_s
+                while time.monotonic() < deadline:
+                    interrupts.check()
+                    time.sleep(min(1, max(0, deadline - time.monotonic())))
+            interrupts.check()
+            authorization.check()
+            verify_queue(report, directory, guard)
+            record.update(status='running', started_utc=night.stamp(), log='logs/' + job['name'] + '.log')
+            status['phase'] = 'testing'
+            night.write_status(path, status)
+            before = night.batches(Path(job['config']['results_dir']))
+            code = None
+            def show_round(run, rounds):
+                message = (f"批次 {index + 1}/{len(jobs)} {job['name']} · "
+                           f"第 {run}/{rounds} 轮完成（总轮次 {index * rounds + run}/{len(jobs) * rounds}）\n")
+                try:
+                    os.write(terminal, message.encode())
+                except OSError:
+                    pass  # An unavailable terminal must not interrupt the experiment.
+
+            progress = {'on_round_complete': show_round} if terminal is not None else {}
+            try:
+                with night.batch_log(directory / record['log']):
+                    code = mixed.experiment(job['config'], interrupts=interrupts, rounds=3, **progress)
+            finally:
+                created = sorted(night.batches(Path(job['config']['results_dir'])) - before)
+                record.update(exit_code=code, finished_utc=night.stamp(),
+                              result_directories=[str(p) for p in created], status='failed')
+                night.write_status(path, status)
+            if code == 130:
+                record['status'] = 'interrupted'
+                raise KeyboardInterrupt
+            metadata = json.loads((created[0] / 'metadata.json').read_text()) if len(created) == 1 else {}
+            if not night.can_continue(code, metadata):
+                raise RuntimeError(job['name'] + ' 未完整完成或调度器收尾异常；见本批日志')
+            record['status'] = 'completed' if code == 0 else 'completed_with_invalid_results'
+            night.write_status(path, status)
+        status['status'] = 'completed' if all(r['exit_code'] == 0 for r in status['jobs']) else 'completed_with_invalid_results'
+        return 0 if status['status'] == 'completed' else 1
+    except KeyboardInterrupt:
+        status.update(status='interrupted', error='用户中断')
+        return 130
+    except Exception as exc:
+        status.update(status='failed', error=str(exc))
+        print(str(exc), file=sys.stderr)
+        return 2
+    finally:
+        if terminal is not None:
+            os.close(terminal)
+        status['finished_utc'] = night.stamp()
+        night.write_status(path, status)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='前14/后14，500/1000/1500/2000 RPS 各三轮；全程防熄屏、休眠')
+    parser.add_argument('--check', action='store_true', help='只检查并保存四组配置、防熄屏和资源预检；无需 sudo，不运行负载或调度器')
+    args = parser.parse_args(argv)
+    if os.getuid() == 0:
+        print('请以普通用户运行 ./midnighttest，不要加 sudo', file=sys.stderr)
+        return 2
+    directory = None
+    guard = None
+    interrupts = Interrupts()
+    try:
+        with contextlib.ExitStack() as stack:
+            shared_lock = acquire_lock()
+            stack.callback(os.close, shared_lock)
+            queue_root = ROOT / 'bench/overnight'
+            queue_root.mkdir(parents=True, exist_ok=True)
+            queue_lock = stack.enter_context((queue_root / 'queue.lock').open('a'))
+            fcntl.flock(queue_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            interrupts.install()
+            stack.callback(interrupts.restore)
+            identity = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ') + f'-{os.getpid()}'
+            directory = ROOT / 'Mixbench/bench/results/midnighttest' / identity
+            directory.mkdir(parents=True)
+            print(f'队列与结果目录: {directory}', flush=True)
+            guard = stack.enter_context(DesktopGuard())
+            jobs = prepare_jobs(directory, power_state())
+            report = preflight(jobs, directory)
+            report['inhibition'] = dict(guard.info)
+            verify_queue(report, directory, guard)
+            night.write_status(directory / 'preflight.json', report)
+            if args.check:
+                night.write_status(directory / 'status.json', {'status': 'checked', 'jobs': [
+                    {'name': j['name'], 'config_file': j['config_file']} for j in jobs]})
+                print('四组配置和防熄屏/休眠检查通过；尚未加载调度器或开始测试。', flush=True)
+                return 0
+            previous = os.environ.get('WISP_SUDO_NONINTERACTIVE')
+            os.environ['WISP_SUDO_NONINTERACTIVE'] = '1'
+            def restore_environment():
+                if previous is None:
+                    os.environ.pop('WISP_SUDO_NONINTERACTIVE', None)
+                else:
+                    os.environ['WISP_SUDO_NONINTERACTIVE'] = previous
+            stack.callback(restore_environment)
+            print('前14/后14，共4批48次；每次冷却至少60秒，批间休息120秒。', flush=True)
+            print('仅现在可能输入一次 sudo 密码；后续认证禁止交互。', flush=True)
+            log = stack.enter_context((directory / 'authorization.log').open('a', buffering=1))
+            authorization = stack.enter_context(night.Authorization(log))
+            scheduler_preflight(jobs[0]['config'], directory / 'scheduler-preflight', interrupts)
+            authorization.check()
+            verify_queue(report, directory, guard)
+            return run_queue(jobs, directory, authorization, guard, report, interrupts)
+    except KeyboardInterrupt:
+        if directory is not None and not (directory / 'status.json').exists():
+            night.write_status(directory / 'status.json', {'status': 'interrupted', 'phase': 'preflight_or_authorization'})
+        return 130
+    except Exception as exc:
+        if directory is not None and not (directory / 'status.json').exists():
+            night.write_status(directory / 'status.json', {'status': 'failed', 'phase': 'preflight_or_authorization', 'error': str(exc)})
+        print('midnighttest 未能完成: ' + str(exc), file=sys.stderr)
+        return 2
+    finally:
+        # ExitStack has released both inhibitors before this final bookkeeping.
+        if directory is not None and guard is not None and (directory / 'status.json').exists():
+            try:
+                state = json.loads((directory / 'status.json').read_text())
+                state['inhibition'] = dict(guard.info)
+                night.write_status(directory / 'status.json', state)
+            except (OSError, ValueError) as exc:
+                print('无法保存防熄屏收尾状态: ' + str(exc), file=sys.stderr)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -14,6 +14,7 @@ from compilebench_runner.interrupts import Interrupts
 from compilebench_runner.metrics import BuildCgroup
 from compilebench_runner.policy import Scheduler
 from compilebench_runner.system import read, temperature, write_json
+from mixbench_runner import collector
 
 
 def subgroup_layout(sides):
@@ -45,7 +46,7 @@ def subgroup_layout(sides):
 
 
 def launch(spec, path, interrupts, evidence):
-    children, pipes = {}, {}
+    children, pipes, samplers = {}, {}, []
     groups, group_info = subgroup_layout(spec["commands"])
     evidence.update(children=children, cgroups=group_info, side_samples=[])
     exit_status = 1
@@ -70,11 +71,12 @@ def launch(spec, path, interrupts, evidence):
                         os.dup2(log.fileno(), 2)
                     os.sched_setaffinity(0, spec["cpus"])
                     os.kill(os.getpid(), signal.SIGSTOP)
-                    os.write(write_fd, f"{time.monotonic():.9f}\n".encode())
+                    os.write(write_fd, f"{time.monotonic_ns()}\n".encode())
                     environment = os.environ.copy()
-                    # Trace only the frontend and never inherit stale output paths from the terminal.
+                    # Final-slot metadata is frontend-only; never inherit stale output paths.
                     environment.pop("WISP_WAKEUP_TRACE_DIR", None)
                     environment.pop("WISP_WAKEUP_CAPACITY", None)
+                    environment.pop("WISP_WAKEUP_TAIL_DIR", None)
                     if side == "front":
                         environment.update(spec.get("front_environment", {}))
                     os.execvpe(command[0], command, environment)
@@ -93,6 +95,29 @@ def launch(spec, path, interrupts, evidence):
             children[side].update(affinity=sorted(os.sched_getaffinity(pid)), nice=os.getpriority(os.PRIO_PROCESS, pid),
                                   scheduling_policy=os.sched_getscheduler(pid))
             write_json(path, evidence)
+        if spec.get("collector"):
+            try:
+                if spec["collector"].get("authorized"):
+                    write_json(path.parent / "collector-request.json", group_info.get("children", {}))
+                    reply = path.parent / "collector-ready.json"
+                    deadline = time.monotonic() + 15
+                    while not reply.exists():
+                        interrupts.check()
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("授权采集器门控超时")
+                        time.sleep(0.02)
+                    error = json.loads(reply.read_text()).get("error")
+                    if error:
+                        raise RuntimeError(error)
+                else:
+                    cgroups = {side: group.path for side, group in groups.items()}
+                    collector.start(samplers, spec, path.parent, cgroups, interrupts)
+            except (OSError, RuntimeError) as exc:
+                evidence["collector_error"] = str(exc)
+                if samplers:
+                    collector.stop(samplers.pop())
+                if spec["collector"].get("authorized"):
+                    raise
         with interrupts.defer():
             Scheduler().verify(spec["expected_scheduler"])
             evidence["temp_start_c"] = temperature(spec.get("sensor"))
@@ -117,7 +142,8 @@ def launch(spec, path, interrupts, evidence):
                     del pipes[side]
                     if not buffers[side]:
                         raise RuntimeError(f"{side} 缺少 exec 时间戳")
-                    children[side]["exec_monotonic_s"] = float(buffers[side].strip())
+                    stamp_ns = int(buffers[side].strip())
+                    children[side].update(exec_monotonic_ns=stamp_ns, exec_monotonic_s=stamp_ns / 1e9)
         write_json(path, evidence)
         next_sample = 0
         while any(not child["reaped"] for child in children.values()):
@@ -125,14 +151,17 @@ def launch(spec, path, interrupts, evidence):
             for side, child in children.items():
                 if child["reaped"]:
                     continue
+                checked_ns = time.monotonic_ns()
                 pid, status = os.waitpid(child["pid"], os.WNOHANG)
                 if pid:
                     child.update(exit_monotonic_s=time.monotonic(), exit_code=os.waitstatus_to_exitcode(status), reaped=True)
                     write_json(path, evidence)
                     if child["exit_code"] != 0:
                         raise RuntimeError(f"{side} 失败，退出码 {child['exit_code']}")
-                elif os.sched_getaffinity(child["pid"]) != set(spec["cpus"]) or os.getpriority(os.PRIO_PROCESS, child["pid"]) != 0:
-                    raise RuntimeError(f"{side} affinity 或 nice 变化")
+                else:
+                    child["last_alive_ns"] = checked_ns
+                    if os.sched_getaffinity(child["pid"]) != set(spec["cpus"]) or os.getpriority(os.PRIO_PROCESS, child["pid"]) != 0:
+                        raise RuntimeError(f"{side} affinity 或 nice 变化")
             if time.monotonic() >= next_sample:
                 evidence["side_samples"].append({"monotonic_s": time.monotonic(),
                     **{side: group.values() for side, group in groups.items()}})
@@ -142,6 +171,13 @@ def launch(spec, path, interrupts, evidence):
     finally:
         # Shared outer session/cgroup cleanup also covers descendants if this worker is killed.
         with interrupts.defer():
+            for process in samplers:
+                try:
+                    code = collector.stop(process)
+                    if code:
+                        evidence["collector_error"] = f"采集器退出码 {code}，见 collector.log"
+                except OSError as exc:
+                    evidence["collector_error"] = str(exc)
             alive = [child for child in children.values() if not child["reaped"]]
             for child in alive:
                 try:

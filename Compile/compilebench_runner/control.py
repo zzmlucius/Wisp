@@ -62,7 +62,12 @@ class BatchScheduler(Scheduler):
         # Both calls have the same Python parent and controlling terminal.
         # After this worker starts, no more sudo invocations are made.
         if self.prefix:
-            subprocess.run([self.prefix[0], "-v"], check=True)
+            # Unattended queues authenticate once in their common Python parent.
+            # Never open a password prompt between batches in that mode.
+            validation = [self.prefix[0], "-v"]
+            if os.environ.get("WISP_SUDO_NONINTERACTIVE") == "1":
+                validation = [self.prefix[0], "-n", "-v"]
+            subprocess.run(validation, check=True)
         self.log = (self.directory / "scheduler-controller.log").open("ab", buffering=0)
         with self.interrupts.defer():
             self.process = subprocess.Popen(command, stdin=subprocess.PIPE,

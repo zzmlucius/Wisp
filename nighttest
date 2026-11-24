@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Run the four mixed-workload batches with one initial sudo authentication."""
+import contextlib
+from datetime import datetime, timezone
+import fcntl
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import threading
+
+ROOT = Path(__file__).resolve().parent
+
+
+def stamp():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def write_status(path, status):
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(status, ensure_ascii=False, indent=2) + '\n')
+    temporary.replace(path)
+
+
+class Authorization:
+    """All sudo children share this Python parent, including refreshes."""
+    def __init__(self, log):
+        self.log = log
+        self.stop = threading.Event()
+        self.failure = None
+        self.thread = None
+
+    def validate(self):
+        subprocess.run(['sudo', '-n', '-v'], stdin=subprocess.DEVNULL,
+                       stdout=self.log, stderr=self.log, check=True, timeout=15)
+
+    def check(self):
+        if self.failure:
+            raise RuntimeError('sudo 非交互刷新失败，停止后续批次: ' + self.failure)
+        self.validate()
+
+    def refresh(self):
+        while not self.stop.wait(30):
+            try:
+                self.validate()
+            except Exception as exc:
+                self.failure = str(exc)
+                return
+
+    def __enter__(self):
+        # The ONLY interactive command in the entire queue.
+        subprocess.run(['sudo', '-v'], check=True)
+        self.validate()
+        self.thread = threading.Thread(target=self.refresh, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        self.thread.join(timeout=16)
+
+
+@contextlib.contextmanager
+def batch_log(path):
+    # Also capture stderr from noninteractive sudo and other subprocesses.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved = [os.dup(1), os.dup(2)]
+    with path.open('a', buffering=1) as stream:
+        try:
+            os.dup2(stream.fileno(), 1)
+            os.dup2(stream.fileno(), 2)
+            yield
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            for fd, previous in zip((1, 2), saved):
+                os.dup2(previous, fd)
+                os.close(previous)
+
+
+def load_jobs():
+    for directory in ('Compile', 'Mixbench'):
+        sys.path.insert(0, str(ROOT / directory))
+    from compilebench_runner import cli as compile_cli
+    from mixbench_runner import cli as mix_cli
+    from mixbench_runner.configuration import load_config
+    jobs = []
+    for rps in (500, 1000, 1500, 2000):
+        cfg = load_config(ROOT / 'Mixbench/mixtest.json', rps=rps)
+        compile_cli.scheduler_specs(cfg)
+        jobs.append({'name': f'mix-rps-{rps}', 'command': ['./Mixbench/mixtest', '3', f'-{rps}'],
+                     'config': cfg, 'experiment': mix_cli.experiment})
+    return jobs
+
+
+def run_batch(job):
+    from compilebench_runner.cli import acquire_lock
+    from compilebench_runner.interrupts import Interrupts
+    lock = acquire_lock()
+    interrupts = Interrupts()
+    try:
+        interrupts.install()
+        return job['experiment'](job['config'], interrupts=interrupts, rounds=3)
+    finally:
+        interrupts.restore()
+        os.close(lock)
+
+
+def batches(root):
+    return {p.parent for p in root.glob('*/metadata.json')}
+
+
+def can_continue(code, metadata):
+    # valid=False (including request-p99 excess) must not discard later RPS groups.
+    return (code in (0, 1) and not metadata.get('fatal_error')
+            and metadata.get('status') in ('completed', 'failed')
+            and len(metadata.get('attempts', [])) == 12
+            and metadata.get('final_scheduler', {}).get('state') == 'disabled'
+            and metadata.get('scheduler_controller', {}).get('status') == 'closed'
+            and metadata.get('scheduler_controller', {}).get('exit_code') == 0)
+
+
+def run_queue(jobs, directory, authorization):
+    status = {'started_utc': stamp(), 'status': 'running', 'jobs': [
+        {'name': j['name'], 'command': j['command'], 'status': 'pending'} for j in jobs]}
+    path = directory / 'status.json'
+    write_status(path, status)
+    try:
+        for job, record in zip(jobs, status['jobs']):
+            authorization.check()
+            root = Path(job['config']['results_dir'])
+            before = batches(root)
+            record.update(status='running', started_utc=stamp(), log=job['name'] + '.log')
+            write_status(path, status)
+            code = None
+            try:
+                with batch_log(directory / record['log']):
+                    code = run_batch(job)
+            finally:
+                created = sorted(batches(root) - before)
+                record.update(exit_code=code, finished_utc=stamp(),
+                              result_directories=[str(p) for p in created], status='finished')
+                write_status(path, status)
+            metadata = json.loads((created[0] / 'metadata.json').read_text()) if len(created) == 1 else {}
+            record['batch_status'] = metadata.get('status')
+            record['fatal_error'] = metadata.get('fatal_error')
+            record['status'] = ('completed' if code == 0 else 'completed_with_invalid_results' if code == 1
+                                else 'interrupted' if code == 130 else 'failed')
+            write_status(path, status)
+            if code == 130:
+                raise KeyboardInterrupt
+            if not can_continue(code, metadata):
+                record['status'] = 'failed'
+                raise RuntimeError(f"{job['name']} 未完整完成或收尾异常；停止后续批次，见该批日志")
+        status['status'] = 'completed' if all(r['exit_code'] == 0 for r in status['jobs']) else 'completed_with_invalid_results'
+        return 0 if status['status'] == 'completed' else 1
+    except KeyboardInterrupt:
+        status.update(status='interrupted', error='用户中断；未启动的批次保持 pending')
+        return 130
+    except Exception as exc:
+        status.update(status='failed', error=str(exc))
+        print(str(exc), file=sys.stderr)
+        return 2
+    finally:
+        status['finished_utc'] = stamp()
+        write_status(path, status)
+
+
+def main():
+    if len(sys.argv) != 1:
+        print('用法: ./nighttest（按固定顺序执行四组 mixed，各 3 轮）', file=sys.stderr)
+        return 2
+    if os.getuid() == 0:
+        print('请以普通用户执行 ./nighttest，不要使用 sudo ./nighttest', file=sys.stderr)
+        return 2
+    lock = None
+    directory = None
+    try:
+        if not shutil.which('sudo'):
+            raise RuntimeError('缺少 sudo')
+        jobs = load_jobs()
+        from compilebench_runner.policy import Scheduler
+        if Scheduler().initial()['state'] != 'disabled':
+            raise RuntimeError('请先自行停止已运行的 scx 调度器，再启动 nighttest')
+        root = ROOT / 'bench/overnight'
+        root.mkdir(parents=True, exist_ok=True)
+        lock = (root / 'queue.lock').open('a')
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        directory = root / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ') + f'-{os.getpid()}')
+        directory.mkdir()
+        print(f'队列记录: {directory}', flush=True)
+        os.environ['WISP_SUDO_NONINTERACTIVE'] = '1'
+        print('仅此时可能要求输入一次 sudo 密码；中间不会再次询问。', flush=True)
+        with (directory / 'authorization.log').open('a', buffering=1) as log:
+            with Authorization(log) as authorization:
+                return run_queue(jobs, directory, authorization)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        if directory is not None and not (directory / 'status.json').exists():
+            write_status(directory / 'status.json', {'status': 'failed',
+                         'phase': 'preflight_or_authorization', 'error': str(exc), 'finished_utc': stamp()})
+        print(f'nighttest 未能启动: {exc}', file=sys.stderr)
+        return 2
+    finally:
+        if lock is not None:
+            lock.close()
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

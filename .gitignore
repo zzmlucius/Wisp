@@ -2,10 +2,29 @@
 __pycache__/
 *.pyc
 
-# Generated benchmark sources, builds, results and validation records
+# Generated benchmark sources, builds and records
 bench/
-
-# Compile local configuration and legacy output directories
-/Compile/**/compiletest.json
-/Compile/**/results/
+results/
+snapshots/
+snapshot.json
+summary.csv
+samples.csv
+workload.csv
+workload-meta.json
+workload-status.jsonl
+finegrain-workload.csv
+finegrain-workload-meta.json
+finegrain-workload-status.jsonl
 /Compile/**/builds/
+
+# Exported test results and local measurement logs
+/Collector/result/
+/SUM/
+/daily_log/
+
+# Local benchmark settings and copies saved with runs
+compiletest.json
+hacktest.json
+mixtest.json
+schtest.json
+*.input.json

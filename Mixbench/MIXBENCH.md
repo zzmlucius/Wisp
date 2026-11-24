@@ -50,24 +50,12 @@
 - 平均 RPS 是否在目标容差内继续记录于 `constraints`；仅 RPS 不足或后台吞吐为零不单独使 `valid=False`，但前台未达标时不能作为满足前台约束的胜者。back 单独测试不适用请求延迟门槛；front 预实验显式设置 `latency_limit_us=null` 时允许探索运行，延迟达标状态留空。
 - 所有无效结果及原始日志均保留。仅 p99 超限不会中止后续调度器或轮次；整批存在无效结果时入口返回非零状态。规则适用于后续新测试，历史 CSV 不自动回写。
 
-### 唤醒 p99 的停止阶段筛选
+### 唤醒 p99 的原生全量统计
 
-- schbench 退出时会唤醒等待中的 worker，但固定版本的退出路径未刷新 `wake_time`；此前无任务时的睡眠可能计入 wakeup，抬高 p99。因此运行阶段评价统一排除 `stopping=1`，只保留记录时尚未收到结束通知的 `stopping=0`。
-- 使用 `--observe-wakeup` 时，`summary.csv` 的 `wakeup_p99_us` 按上述保留样本重新计算 nearest-rank p99。四种调度器使用相同规则，不固定删除 14 条、不按行尾或延迟大小筛选；正常阶段的大值仍保留。
-- 仅完整观测可以重算；缺失、溢出或没有运行阶段样本时，该指标留空并记为技术无效，不回退到原生全量值。
-- 原始 `front-wakeup.csv`、原生日志和 JSON 保留审计；`front-wakeup-running.csv` 保存筛选结果，`attempt.json.wakeup_filter` 记录原生 p99、保留/排除数量及规则版本 `running-wakeup-v1`。未启用观测仍为原生口径，历史缺少逐条记录的结果不能重算或与筛选值混合排名。
+- 后续 mixtest 和 nighttest 使用原版 schbench；不进行末条或 `stopping` 筛选，不采集末条或逐条记录。
+- `front.log`、`front-native.json`、`summary.csv` 统一采用原生全部唤醒样本，元数据标记 `native_all` / `native`。
+- 兼容接受旧 `--observe-wakeup` 参数，但不启用筛选或观测；旧 `wakeup_observation` 设置忽略。
+- 原生退出唤醒可能把先前空闲等待计入延迟，故全量唤醒 p99 可能很高。请求 p99 的统计与 ≤30 ms 有效性门槛保持。
+- 历史结果原样保留，不混用全量与历史筛选后的唤醒统计口径。
 
-- 整批保存 `snapshot.json`、`mixtest.json`、`metadata.json`。case、seed/orders、命令、统计范围/同步容差和最终状态放元数据；目标与达标状态放配置/`attempt.json`，不重复放 CSV。
-- `run-NNN/<策略>/`保存 `snapshot.json`、`front.log`、`back.log`、`front-native.json`（支持时）、`samples.csv`、`attempt.json`；按 case 只生成实际负载文件。准备日志和 scheduler/controller 日志命名沿用已有测试。未知当前策略用 `current/`，原始 ops 仍记录。
-- `attempt.json`保留各负载参数、退出码、统计起止/耗时、后台总工作量、同步证据及缺失原因。`summary.csv`每次尝试一行，公共字段含义沿用 compiletest，schbench 三字段均指前台；单独 case 中不适用的字段留空。
-
-```csv
-policy,run,valid,exit_code,wall_s,cpu_time_s,peak_memory_bytes,temp_start_c,temp_peak_sampled_c,avg_rps,request_p99_us,wakeup_p99_us,back_events_s,error
-```
-
-- 汇总输出及 `./Clean`沿用已有风格，只清本测试数据，保留程序、源码和共享配置；与其他测试协调互斥。
-- 先用短任务验证入口、随机轮、解析、双负载并发/同步、一方失败/超时及清理。真实验收：`./mixtest`一行、run=1、保持当前策略；`./mixtest 1`四行、四策略各一次、run=1、顺序与记录一致，正常完成均技术有效并最终 disabled。完整 n 轮为 4n 行；front/back 验证相同行数及单负载行为。性能达标与否如实报告。
-- README 说明用法、配置、字段、复用接口、RPS/SLO 预实验方法、同步近似及真实验证环境，不将替身验证声称为真实验收。真实长测试按用户要求执行。
-
-依据：[Shenango](https://www.usenix.org/conference/nsdi19/presentation/ousterhout)、[Heracles](https://mast.stanford.edu/pubs/heracles_improving_resource_efficiency_at_scale/)、[schbench](https://github.com/masoncl/schbench)、[sysbench](https://github.com/akopytov/sysbench)。具体时长、线程和同步阈值为本项目预实验起点。
-
+结果目录采用 `前台worker数-后台线程数-RPS-供电状态_UTC时间戳-PID`，供电 `0` 未插电、`1` 插电、`unknown` 未知，保留时间戳区分重复实验。
